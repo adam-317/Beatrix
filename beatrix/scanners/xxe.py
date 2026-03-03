@@ -387,7 +387,7 @@ class XXEScanner(BaseScanner):
                 ']>\n'
                 '<root>test</root>'
             ),
-            expected_pattern=r"[a-zA-Z0-9\-\.]+",
+            expected_pattern=r"(?:root:.*:0:0:|\[fonts\]|\[extensions\]|PATH=|HOSTNAME=)",
             description="Error-based XXE: invalid scheme triggers error with file content",
         ))
 
@@ -733,8 +733,8 @@ class XXEScanner(BaseScanner):
                 content=test_xml,
                 headers={"Content-Type": "application/xml"},
             )
-            # Accepted if not 415 (Unsupported Media Type) and not 400 with XML error
-            return resp.status_code not in (415, 406)
+            # Accepted if not 415 (Unsupported Media Type), not 406, and not 403 (WAF block)
+            return resp.status_code not in (415, 406, 403)
         except Exception:
             return False
 
@@ -754,6 +754,17 @@ class XXEScanner(BaseScanner):
             body = resp.text
             matched = False
             extracted = None
+
+            # Reject WAF blocks and generic error responses as non-results
+            if resp.status_code in (403, 429, 503):
+                return XXEResult(
+                    payload=payload,
+                    response_status=resp.status_code,
+                    response_body=body,
+                    response_time=elapsed,
+                    matched=False,
+                    extracted_data=None,
+                )
 
             if payload.expected_pattern:
                 match = re.search(payload.expected_pattern, body, re.MULTILINE)

@@ -505,17 +505,32 @@ class DirsearchRunner(ExternalTool):
                 with open(outfile.name, "r") as f:
                     data = json.load(f)
 
-                # dirsearch JSON format varies by version
+                # dirsearch JSON format varies by version:
+                #   v0.4.x: {"results": {"https://target/": [entries...]}}
+                #   v0.4.3+: {"results": [entries...]}
+                #   Some versions: bare list [entries...]
                 if isinstance(data, dict):
-                    for target_url, entries in data.get("results", {}).items():
-                        if isinstance(entries, list):
-                            for entry in entries:
-                                results.append({
-                                    "path": entry.get("path", ""),
-                                    "status": entry.get("status", 0),
-                                    "size": entry.get("content-length", 0),
-                                    "redirect": entry.get("redirect", ""),
-                                })
+                    raw_results = data.get("results", [])
+                    if isinstance(raw_results, dict):
+                        # Keyed by target URL
+                        for target_url, entries in raw_results.items():
+                            if isinstance(entries, list):
+                                for entry in entries:
+                                    results.append({
+                                        "path": entry.get("path", ""),
+                                        "status": entry.get("status", 0),
+                                        "size": entry.get("content-length", 0),
+                                        "redirect": entry.get("redirect", ""),
+                                    })
+                    elif isinstance(raw_results, list):
+                        # Flat list of entries
+                        for entry in raw_results:
+                            results.append({
+                                "path": entry.get("path", entry.get("url", "")),
+                                "status": entry.get("status", 0),
+                                "size": entry.get("content-length", entry.get("size", 0)),
+                                "redirect": entry.get("redirect", ""),
+                            })
                 elif isinstance(data, list):
                     for entry in data:
                         results.append({

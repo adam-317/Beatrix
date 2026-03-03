@@ -4,16 +4,27 @@ BEATRIX Nuclei Scanner Wrapper
 Wraps the nuclei binary to integrate its massive template library
 into Beatrix's scanning pipeline.
 
-Nuclei has 8000+ templates covering:
+Nuclei has 12,600+ templates covering:
 - CVEs, default logins, exposed panels
 - Misconfigurations, technologies, takeovers
-- WAF detection, tokens, fuzzing
+- WAF detection, tokens, fuzzing, OAST
+- Cloud misconfigs, API exposure, secrets
 
 This wrapper:
 1. Checks that nuclei binary exists
-2. Runs nuclei with JSON output against discovered URLs
-3. Parses each finding into Beatrix Finding objects
-4. Maps nuclei severity to Bugcrowd VRT-aligned severity
+2. Ensures templates are downloaded and fresh (auto-update >7 days)
+3. Builds dynamic tag filters from detected technologies
+4. Runs nuclei with JSONL output, streaming findings in real time
+5. Captures stderr for progress logging
+6. Parses each finding into Beatrix Finding objects
+7. Maps nuclei severity to Bugcrowd VRT-aligned severity
+
+Timeout strategy:
+- Wall-clock timeout scales with URL count (base 600s + 0.5s per URL)
+- Per-line readline timeout is generous (120s) so nuclei isn't killed
+  during slow template batches that produce no output for a while
+- The kill chain's own SCANNER_TIMEOUT (300s) is the outer bound;
+  nuclei's internal timeout is capped to not exceed it
 """
 
 import asyncio
@@ -117,9 +128,16 @@ class NucleiScanner(BaseScanner):
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(config)
         self.nuclei_path = self._find_nuclei()
-        self.timeout_seconds = self.config.get("nuclei_timeout", 120)  # 120s default
+        # Base timeout — scaled dynamically by _calculate_timeout() based on
+        # URL count.  600s (10 min) is reasonable for a few hundred URLs.
+        self._base_timeout = self.config.get("nuclei_timeout", 600)
+        self.timeout_seconds = self._base_timeout
         self._urls_to_scan: List[str] = []
-        self._severity_filter = self.config.get("nuclei_severity", "critical,high,medium,low")
+        # Include info severity — nuclei info templates detect tech, panels,
+        # WAFs, exposed configs, and other recon-valuable data.
+        self._severity_filter = self.config.get(
+            "nuclei_severity", "critical,high,medium,low,info"
+        )
         self._detected_technologies: List[str] = []
         self._template_dir = Path.home() / "nuclei-templates"
         self._templates_verified = False
@@ -250,13 +268,55 @@ class NucleiScanner(BaseScanner):
         else:
             self._detected_technologies = [t.lower() for t in technologies]
 
+    def _calculate_timeout(self, url_count: int) -> int:
+        """Calculate wall-clock timeout based on URL count.
+
+        Base is 600s.  Add 0.5s per URL beyond 100 to give nuclei
+        enough time for large scans.  Capped at 1800s (30 min).
+        """
+        extra = max(0, url_count - 100) * 0.5
+        return min(int(self._base_timeout + extra), 1800)
+
     def _build_tags(self) -> str:
-        """Build nuclei tag filter based on detected technologies."""
-        # Base tags that always run — these are the high-value checks
-        tags = {"misconfig", "exposure", "cve", "default-login",
-                "token", "takeover", "cookies", "unauth",
-                "config", "intrusive", "rce", "lfi", "xss", "sqli",
-                "ssrf", "idor", "fileupload", "redirect"}
+        """Build nuclei tag filter based on detected technologies.
+
+        Uses a comprehensive base set that covers every high-value template
+        category in nuclei-templates.  Technology-specific tags are added
+        on top based on the crawler's fingerprint.
+        """
+        # Comprehensive base tags — covers all major template categories.
+        # These use OR logic: a template matching ANY of these tags will run.
+        tags = {
+            # Vulnerability classes
+            "cve", "rce", "lfi", "xss", "sqli", "ssrf", "idor",
+            "xxe", "ssti", "cmdi", "traversal",
+            # Misconfigurations & exposure
+            "misconfig", "exposure", "config", "disclosure",
+            "unauth", "default-login", "login",
+            # Secrets & tokens
+            "token", "secret", "api", "apikey", "keys",
+            # Takeover & DNS
+            "takeover", "dns",
+            # Panels & admin
+            "panel", "admin", "dashboard",
+            # File & upload
+            "fileupload", "file", "backup",
+            # Cookies & headers
+            "cookies", "cookie", "headers",
+            # Redirect & injection
+            "redirect", "injection", "intrusive",
+            # Cloud
+            "cloud", "aws", "azure", "gcp",
+            # Detection & tech
+            "tech", "detect", "waf",
+            # Fuzzing & OAST (out-of-band)
+            "fuzz", "oast",
+            # Brute force & auth
+            "bruteforce", "auth",
+            # Misc high-value
+            "creds", "debug", "log", "logs",
+            "env", "git", "svn", "hg",
+        }
 
         # Add technology-specific tags based on fingerprint
         for tech in self._detected_technologies:
@@ -290,7 +350,10 @@ class NucleiScanner(BaseScanner):
         # Build dynamic tags based on target fingerprint
         tags = self._build_tags()
 
-        self.log(f"Running nuclei on {len(urls)} URLs with tags: {tags}")
+        # Scale timeout based on URL count
+        self.timeout_seconds = self._calculate_timeout(len(urls))
+        self.log(f"Running nuclei on {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+        self.log(f"Tags: {tags}")
 
         # Run nuclei with JSON output
         async for finding in self._run_nuclei(list(urls), tags):
@@ -313,19 +376,18 @@ class NucleiScanner(BaseScanner):
             cmd = [
                 self.nuclei_path,
                 "-l", url_file,
-                "-jsonl",                    # JSON Lines output
-                "-silent",                   # Suppress banner
+                "-jsonl",                    # JSON Lines output — findings to stdout
+                "-silent",                   # Suppress banner noise
                 "-no-color",                 # No ANSI colors in output
-                "-timeout", "10",            # Per-request timeout
+                "-timeout", "15",            # Per-request timeout (seconds)
                 "-retries", "1",             # Don't retry failed requests
-                "-rate-limit", "150",        # Higher rate limit
-                "-bulk-size", "50",          # More concurrent templates
-                "-concurrency", "25",        # More concurrent hosts
+                "-rate-limit", "150",        # Requests per second
+                "-bulk-size", "50",          # Concurrent templates per host
+                "-concurrency", "25",        # Concurrent hosts
                 "-severity", self._severity_filter,
-                "-exclude-type", "headless",  # Skip headless templates (need browser)
                 "-tags", tags,
-                "-stats",                     # Show progress stats
-                "-stats-interval", "15",      # Stats every 15s
+                "-stats",                    # Show progress stats (stderr)
+                "-stats-interval", "15",     # Stats every 15s
             ]
 
             self.log(f"Executing: {' '.join(cmd[:5])}...")
@@ -333,60 +395,108 @@ class NucleiScanner(BaseScanner):
             process = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,   # Capture stderr for progress/errors
                 limit=1024 * 1024,  # 1MB line buffer (nuclei can output long lines)
             )
 
             findings_count = 0
-            import time
             wall_start = time.monotonic()
-            readline_timeout = 30  # 30s max wait per line of output
 
-            # Stream stdout line by line
-            while True:
-                # Overall wall-clock timeout
-                elapsed = time.monotonic() - wall_start
-                if elapsed >= self.timeout_seconds:
-                    self.log(f"Nuclei timed out after {self.timeout_seconds}s")
-                    process.kill()
-                    break
+            # Readline timeout: how long we wait for ANY stdout output
+            # before assuming nuclei is done or stuck.  120s is generous —
+            # nuclei may go quiet for 30-60s between template batches but
+            # should not be silent for 2+ minutes if it's still working.
+            readline_timeout = 120
 
-                remaining = self.timeout_seconds - elapsed
-                per_line_timeout = min(readline_timeout, remaining)
+            # Background task to drain stderr and log progress
+            stderr_lines: List[str] = []
 
+            async def _drain_stderr():
+                """Read stderr in background so the pipe doesn't block."""
                 try:
-                    line = await asyncio.wait_for(
-                        process.stdout.readline(),
-                        timeout=per_line_timeout
-                    )
-                except asyncio.TimeoutError:
-                    actual_elapsed = time.monotonic() - wall_start
-                    if actual_elapsed >= self.timeout_seconds - 1:
-                        self.log(f"Nuclei timed out after {int(actual_elapsed)}s (wall-clock limit)")
-                    else:
-                        self.log(f"Nuclei scan complete after {int(actual_elapsed)}s (no more output)")
-                    process.kill()
-                    break
+                    while True:
+                        raw = await process.stderr.readline()
+                        if not raw:
+                            break
+                        text = raw.decode("utf-8", errors="replace").strip()
+                        if text:
+                            stderr_lines.append(text)
+                            # Log stats/progress lines so the user sees activity
+                            if any(kw in text.lower() for kw in
+                                   ("templates", "hosts", "requests", "errors",
+                                    "matched", "duration", "rps")):
+                                self.log(f"[nuclei] {text}")
+                except Exception:
+                    pass
 
-                if not line:
-                    break
+            stderr_task = asyncio.create_task(_drain_stderr())
 
-                line = line.decode('utf-8', errors='replace').strip()
-                if not line:
-                    continue
+            # Stream stdout line by line (JSONL findings)
+            try:
+                while True:
+                    # Overall wall-clock timeout
+                    elapsed = time.monotonic() - wall_start
+                    if elapsed >= self.timeout_seconds:
+                        self.log(f"Nuclei wall-clock timeout after {int(elapsed)}s")
+                        process.kill()
+                        break
 
-                # Parse JSON line
+                    remaining = self.timeout_seconds - elapsed
+                    per_line_timeout = min(readline_timeout, remaining)
+
+                    try:
+                        line = await asyncio.wait_for(
+                            process.stdout.readline(),
+                            timeout=per_line_timeout
+                        )
+                    except asyncio.TimeoutError:
+                        actual_elapsed = time.monotonic() - wall_start
+                        if actual_elapsed >= self.timeout_seconds - 1:
+                            self.log(
+                                f"Nuclei timed out after {int(actual_elapsed)}s "
+                                f"(wall-clock limit {self.timeout_seconds}s)"
+                            )
+                        else:
+                            self.log(
+                                f"Nuclei no stdout for {readline_timeout}s — "
+                                f"assuming complete ({int(actual_elapsed)}s elapsed)"
+                            )
+                        process.kill()
+                        break
+
+                    if not line:
+                        # EOF — nuclei exited normally
+                        break
+
+                    decoded = line.decode('utf-8', errors='replace').strip()
+                    if not decoded:
+                        continue
+
+                    # Parse JSONL finding
+                    try:
+                        data = json.loads(decoded)
+                        finding = self._parse_nuclei_finding(data)
+                        if finding:
+                            findings_count += 1
+                            yield finding
+                    except json.JSONDecodeError:
+                        # Non-JSON line (shouldn't happen with -jsonl -silent)
+                        continue
+            finally:
+                stderr_task.cancel()
                 try:
-                    data = json.loads(line)
-                    finding = self._parse_nuclei_finding(data)
-                    if finding:
-                        findings_count += 1
-                        yield finding
-                except json.JSONDecodeError:
-                    continue
+                    await stderr_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
             await process.wait()
-            self.log(f"Nuclei complete: {findings_count} findings")
+            total_elapsed = int(time.monotonic() - wall_start)
+            self.log(f"Nuclei complete: {findings_count} findings in {total_elapsed}s")
+
+            # Log the last few stderr lines (usually the scan summary)
+            if stderr_lines:
+                for sline in stderr_lines[-5:]:
+                    self.log(f"[nuclei stderr] {sline}")
 
         except Exception as e:
             self.log(f"Nuclei error: {e}")

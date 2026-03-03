@@ -248,7 +248,13 @@ class KillChainExecutor:
     # =========================================================================
 
     # Per-scanner timeout (seconds) — prevents any single scanner from blocking the hunt
-    SCANNER_TIMEOUT = 300  # 5 minutes
+    SCANNER_TIMEOUT = 300  # 5 minutes default
+
+    # Override timeouts for scanners that legitimately need more time.
+    # Nuclei runs 12,600+ templates and routinely needs 10+ minutes.
+    SCANNER_TIMEOUT_OVERRIDES = {
+        "nuclei": 900,   # 15 minutes — nuclei manages its own internal timeout
+    }
 
     async def _run_scanner(self, scanner_name: str, target: str, context: Dict[str, Any],
                            scan_context=None) -> Dict[str, Any]:
@@ -305,10 +311,11 @@ class KillChainExecutor:
                         result["findings"].append(finding)
                         self._emit("finding", scanner=scanner_name, finding=finding)
 
-            await asyncio.wait_for(_collect(), timeout=self.SCANNER_TIMEOUT)
+            await asyncio.wait_for(_collect(), timeout=self.SCANNER_TIMEOUT_OVERRIDES.get(scanner_name, self.SCANNER_TIMEOUT))
         except asyncio.TimeoutError:
+            effective_timeout = self.SCANNER_TIMEOUT_OVERRIDES.get(scanner_name, self.SCANNER_TIMEOUT)
             self._emit("scanner_error", scanner=scanner_name,
-                       error=f"Timed out after {self.SCANNER_TIMEOUT}s (partial results: {len(result['findings'])} findings)")
+                       error=f"Timed out after {effective_timeout}s (partial results: {len(result['findings'])} findings)")
         except Exception as e:
             self._emit("scanner_error", scanner=scanner_name, error=str(e))
 
@@ -363,10 +370,11 @@ class KillChainExecutor:
                                        error=f"Error on URL {i+1}/{len(urls)} ({url}): {e}")
                             continue
 
-            await asyncio.wait_for(_collect_multi(), timeout=self.SCANNER_TIMEOUT)
+            await asyncio.wait_for(_collect_multi(), timeout=self.SCANNER_TIMEOUT_OVERRIDES.get(scanner_name, self.SCANNER_TIMEOUT))
         except asyncio.TimeoutError:
+            effective_timeout = self.SCANNER_TIMEOUT_OVERRIDES.get(scanner_name, self.SCANNER_TIMEOUT)
             self._emit("scanner_error", scanner=scanner_name,
-                       error=f"Timed out after {self.SCANNER_TIMEOUT}s scanning {len(urls)} URLs (partial results: {len(result['findings'])} findings)")
+                       error=f"Timed out after {effective_timeout}s scanning {len(urls)} URLs (partial results: {len(result['findings'])} findings)")
         except Exception as e:
             self._emit("scanner_error", scanner=scanner_name, error=str(e))
 
@@ -1513,16 +1521,17 @@ class KillChainExecutor:
                 # Feed findings into correlation engine to discover chains
                 corr_engine = EventCorrelationEngine()
                 for finding in all_findings:
-                    corr_engine.add_event({
-                        "type": getattr(finding, "scanner_module", "unknown"),
+                    module = getattr(finding, "scanner_module", "unknown")
+                    corr_engine.ingest_finding({
+                        "type": module,
                         "title": getattr(finding, "title", ""),
                         "url": getattr(finding, "url", ""),
                         "severity": getattr(finding, "severity", "").value if hasattr(getattr(finding, "severity", None), "value") else "info",
                         "evidence": getattr(finding, "evidence", ""),
                         "parameter": getattr(finding, "parameter", ""),
-                    })
+                    }, module=module)
 
-                corr_engine.correlate()
+                corr_engine.detect_chains()
 
                 if corr_engine.chains:
                     poc_engine = PoCChainEngine(target)
