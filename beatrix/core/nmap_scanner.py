@@ -201,6 +201,117 @@ class NetworkScanner:
         """Run arbitrary nmap arguments."""
         return await self._run(target, ports, arguments, "custom_scan", sudo)
 
+    # ---- Full-coverage scans (NETWORK_GAMEPLAN Phase 1) ----
+
+    async def full_tcp_scan(
+        self, target: str, timeout: int = 600,
+    ) -> ScanResult:
+        """SYN scan all 65535 TCP ports with aggressive timing.
+
+        Phase 1a of the network pipeline. Returns open + filtered ports.
+        Requires root for SYN scan (-sS).
+        """
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = "-sS -p- --min-rate 3000 -T4 --open"
+            return await self._run(target, None, args, "full_tcp_scan", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
+    async def nse_vuln_scan(
+        self, target: str, ports: str, timeout: int = 600,
+    ) -> ScanResult:
+        """Run 'vuln and safe' NSE scripts on specified ports.
+
+        Phase 1c — CVEs, known vulns, misconfigs.
+        """
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = '-sV --script "vuln and safe"'
+            return await self._run(target, ports, args, "nse_vuln_scan", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
+    async def nse_discovery_scan(
+        self, target: str, ports: str, timeout: int = 600,
+    ) -> ScanResult:
+        """Run 'discovery and safe' NSE scripts on specified ports.
+
+        Phase 1d — http-enum, dns-brute, ssl-cert, banners.
+        """
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = '-sV --script "discovery and safe"'
+            return await self._run(target, ports, args, "nse_discovery_scan", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
+    async def nse_auth_scan(
+        self, target: str, ports: str, timeout: int = 600,
+    ) -> ScanResult:
+        """Run 'auth and safe' NSE scripts on specified ports.
+
+        Phase 1e — default creds, anonymous access, auth methods.
+        """
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = '-sV --script "auth and safe"'
+            return await self._run(target, ports, args, "nse_auth_scan", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
+    async def selective_udp_scan(
+        self, target: str, top_n: int = 50, timeout: int = 120,
+    ) -> ScanResult:
+        """Quick UDP scan on top N ports (DNS, SNMP, NTP, SSDP).
+
+        Phase 1f — fast, high-value UDP services only.
+        """
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = f"-sU -sV --top-ports {top_n}"
+            return await self._run(target, None, args, "selective_udp_scan", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
+    async def nse_service_scripts(
+        self, target: str, ports: str, service: str, timeout: int = 300,
+    ) -> ScanResult:
+        """Run service-specific NSE scripts.
+
+        Phase 3 — deep audit for specific services (ftp, smtp, mysql, etc.).
+        """
+        # Map service names to relevant NSE script categories
+        script_map = {
+            "ftp": "ftp-anon,ftp-bounce,ftp-vsftpd-backdoor,ftp-syst",
+            "smtp": "smtp-open-relay,smtp-enum-users,smtp-commands,smtp-ntlm-info",
+            "dns": "dns-zone-transfer,dns-recursion,dns-brute,dns-cache-snoop",
+            "mysql": "mysql-empty-password,mysql-info,mysql-enum,mysql-databases",
+            "postgres": "pgsql-brute,pgsql-info",
+            "redis": "redis-info",
+            "mongodb": "mongodb-databases,mongodb-info",
+            "docker": "docker-version",
+            "http": "http-enum,http-methods,http-security-headers,http-title,http-server-header",
+            "ssl": "ssl-enum-ciphers,ssl-cert,ssl-heartbleed,ssl-poodle,ssl-ccs-injection",
+            "ssh": "ssh2-enum-algos,sshv1",
+            "smb": "smb-vuln-ms17-010,smb-os-discovery,smb-security-mode",
+            "rdp": "rdp-vuln-ms12-020,rdp-ntlm-info",
+            "vnc": "vnc-info,vnc-brute",
+        }
+        scripts = script_map.get(service, f"{service}-*")
+        old_timeout = self.timeout
+        self.timeout = timeout
+        try:
+            args = f'-sV --script "{scripts}"'
+            return await self._run(target, ports, args, f"nse_{service}", sudo=True)
+        finally:
+            self.timeout = old_timeout
+
     # ---- Quick recon helpers ----
 
     async def top_ports(self, target: str, count: int = 100) -> ScanResult:

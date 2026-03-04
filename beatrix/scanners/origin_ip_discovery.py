@@ -28,7 +28,9 @@ CLOUDFLARE_IP_RANGES = [
     "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
     "141.101.64.0/18", "108.162.192.0/18", "190.93.240.0/20", "188.114.96.0/20",
     "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
-    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22"
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    # Cloudflare DNS / WARP — NOT origin IPs
+    "1.0.0.0/24", "1.1.1.0/24",
 ]
 
 AKAMAI_IP_RANGES = [
@@ -41,6 +43,39 @@ FASTLY_IP_RANGES = [
     "103.245.224.0/24", "104.156.80.0/20", "151.101.0.0/16", "157.52.64.0/18",
     "167.82.0.0/17", "167.82.128.0/20", "167.82.160.0/20", "167.82.224.0/20",
     "172.111.64.0/18", "185.31.16.0/22", "199.27.72.0/21", "199.232.0.0/16"
+]
+
+# Known hosting/SaaS provider IP ranges — these are NEVER the target's
+# origin IP, they're shared infrastructure serving many tenants.
+HOSTING_PROVIDER_RANGES = [
+    # Shopify
+    "23.227.32.0/20",       # 23.227.32.0 – 23.227.47.255
+    # Heroku
+    "3.0.0.0/15", "52.0.0.0/11",   # subset of AWS used by Heroku
+    # GitHub Pages
+    "185.199.108.0/22",
+    # Netlify
+    "75.2.60.0/24", "99.83.231.0/24",
+    # Vercel
+    "76.76.21.0/24",
+    # Squarespace
+    "198.185.159.0/24", "198.49.23.0/24",
+    # Wix
+    "185.230.63.0/24", "185.230.60.0/22",
+    # WordPress.com (Automattic)
+    "192.0.64.0/18",
+]
+
+# Subdomains that typically point to third-party SaaS, not the origin.
+# IPs from these should be heavily penalized or excluded.
+THIRD_PARTY_SUBDOMAIN_PREFIXES = [
+    "shop", "store", "blog", "mail", "email", "smtp", "imap", "pop",
+    "support", "help", "helpdesk", "desk", "status", "docs", "wiki",
+    "calendar", "meet", "chat", "slack", "jira", "confluence",
+    "sentry", "cdn", "static", "assets", "media", "img", "images",
+    "staging", "dev", "test", "sandbox", "demo", "preview",
+    "autodiscover", "lyncdiscover", "sip", "selector1", "selector2",
+    "em", "click", "track", "link", "go", "redirect",
 ]
 
 
@@ -62,15 +97,29 @@ class OriginIPDiscovery:
     """
 
     def __init__(self, config: Optional[Dict] = None):
+        import os
+
         self.config = config or {}
         self.timeout = aiohttp.ClientTimeout(total=30)
         self.results: List[OriginIPResult] = []
 
-        # API keys (optional - enables more techniques)
-        self.securitytrails_key = self.config.get('securitytrails_api_key')
-        self.censys_id = self.config.get('censys_api_id')
-        self.censys_secret = self.config.get('censys_api_secret')
-        self.shodan_key = self.config.get('shodan_api_key')
+        # API keys — config dict wins, then environment variables, then None
+        self.securitytrails_key = (
+            self.config.get('securitytrails_api_key')
+            or os.environ.get('SECURITYTRAILS_API_KEY')
+        )
+        self.censys_id = (
+            self.config.get('censys_api_id')
+            or os.environ.get('CENSYS_API_ID')
+        )
+        self.censys_secret = (
+            self.config.get('censys_api_secret')
+            or os.environ.get('CENSYS_API_SECRET')
+        )
+        self.shodan_key = (
+            self.config.get('shodan_api_key')
+            or os.environ.get('SHODAN_API_KEY')
+        )
 
         # User agent rotation
         self.user_agents = [
@@ -351,14 +400,21 @@ class OriginIPDiscovery:
                             # Resolve each subdomain
                             for name in list(names)[:20]:
                                 try:
+                                    # Skip subdomains that obviously point to SaaS
+                                    is_third_party = self._is_third_party_subdomain(name, domain)
+
                                     ips = socket.gethostbyname_ex(name)[2]
                                     for ip in ips:
                                         if self._is_valid_ip(ip) and not self._is_cdn_ip(ip):
                                             if not any(r['ip'] == ip for r in result['ips']):
+                                                # Third-party subdomains (shop.*, blog.*, etc.)
+                                                # get heavily penalized — their IPs are almost
+                                                # never the real origin.
+                                                conf = 0.2 if is_third_party else 0.7
                                                 result['ips'].append({
                                                     'ip': ip,
                                                     'source': f'SSL Cert ({name})',
-                                                    'confidence': 0.7
+                                                    'confidence': conf,
                                                 })
                                 except Exception:
                                     pass
@@ -412,15 +468,19 @@ class OriginIPDiscovery:
         """Check common subdomains that might point to origin"""
         result = {'technique': 'Subdomain Correlation', 'ips': []}
 
-        # Subdomains that often bypass CDN
-        bypass_subdomains = [
+        # Subdomains that often bypass CDN — split by likelihood.
+        # "direct", "origin", "backend" are strong signals.
+        # "mail", "ftp", "cpanel" are moderate — may or may not be on origin.
+        HIGH_SIGNAL = {
             'direct', 'direct-connect', 'origin', 'origin-www', 'real',
-            'backend', 'server', 'old', 'legacy', 'dev', 'staging', 'test',
+            'backend', 'server', 'old', 'legacy', 'www2', 'web', 'web1',
+            'web2', 'secure', 'portal', 'api', 'api1', 'api2', 'internal',
+            'intranet', 'private', 'vpn', 'remote', 'gateway',
+        }
+        bypass_subdomains = list(HIGH_SIGNAL) + [
             'mail', 'webmail', 'smtp', 'pop', 'imap', 'mx', 'mx1', 'mx2',
             'ftp', 'sftp', 'ssh', 'admin', 'panel', 'cpanel', 'whm',
-            'api', 'api1', 'api2', 'internal', 'intranet', 'private',
-            'vpn', 'remote', 'gateway', 'ns1', 'ns2', 'dns', 'dns1',
-            'www2', 'web', 'web1', 'web2', 'secure', 'portal'
+            'ns1', 'ns2', 'dns', 'dns1', 'dev', 'staging', 'test',
         ]
 
         async def resolve_subdomain(subdomain: str):
@@ -429,10 +489,15 @@ class OriginIPDiscovery:
                 ips = socket.gethostbyname_ex(fqdn)[2]
                 for ip in ips:
                     if self._is_valid_ip(ip) and not self._is_cdn_ip(ip):
+                        # High-signal subdomains get more confidence
+                        conf = 0.75 if subdomain in HIGH_SIGNAL else 0.55
+                        # Third-party subdomains get penalized
+                        if self._is_third_party_subdomain(fqdn, domain):
+                            conf = 0.2
                         return {
                             'ip': ip,
                             'source': f'Subdomain ({fqdn})',
-                            'confidence': 0.7
+                            'confidence': conf,
                         }
             except Exception:
                 pass
@@ -473,8 +538,18 @@ class OriginIPDiscovery:
                         'Host': domain
                     }
                     async with session.get(url, headers=headers, ssl=False) as resp:
-                        # Check response headers for IP leaks
+                        # Check response headers for IP leaks.
+                        # Only headers that plausibly expose origin IPs — NOT
+                        # Set-Cookie, Content-Type, or other unrelated headers.
+                        ORIGIN_LEAK_HEADERS = {
+                            'x-real-ip', 'x-origin-ip', 'x-forwarded-for',
+                            'x-backend-server', 'x-served-by', 'x-host',
+                            'x-backend', 'x-upstream', 'via', 'server',
+                            'x-varnish', 'x-cache-backend',
+                        }
                         for header, value in resp.headers.items():
+                            if header.lower() not in ORIGIN_LEAK_HEADERS:
+                                continue
                             ip_match = re.search(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', str(value))
                             if ip_match:
                                 ip = ip_match.group()
@@ -482,7 +557,7 @@ class OriginIPDiscovery:
                                     result['ips'].append({
                                         'ip': ip,
                                         'source': f'Header Leak ({header})',
-                                        'confidence': 0.9
+                                        'confidence': 0.85
                                     })
                 except Exception:
                     pass
@@ -632,47 +707,78 @@ class OriginIPDiscovery:
         domain: str,
         candidates: List[Dict]
     ) -> List[Dict]:
-        """Validate discovered IPs by checking if they respond for the domain"""
+        """Validate discovered IPs by checking if they actually serve the domain.
+
+        A real origin IP should:
+        1. Respond to HTTP requests with Host: <domain>
+        2. Return content that references the domain (not a generic hosting page)
+        3. NOT return a Shopify/Heroku/etc. branded error page
+        """
         validated = []
+
+        # Known hosting provider signatures in response bodies/headers
+        HOSTING_SIGNATURES = [
+            "shopify", "squarespace", "wix.com", "herokuapp.com",
+            "wordpress.com", "ghost.io", "webflow.com", "netlify",
+            "vercel", "github.io", "pages.dev", "only a shopify store",
+        ]
 
         async def check_ip(ip_info: Dict) -> Optional[Dict]:
             ip = ip_info['ip']
             try:
                 async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
-                    # Try HTTPS with Host header
-                    try:
-                        async with session.get(
-                            f"https://{ip}/",
-                            headers={'Host': domain},
-                            ssl=False
-                        ) as resp:
-                            if resp.status < 500:  # Any response indicates it's alive
-                                ip_info['validated'] = True
-                                ip_info['https_status'] = resp.status
-                                # Increase confidence if it responds correctly
-                                ip_info['confidence'] = min(ip_info.get('confidence', 0.5) + 0.2, 1.0)
-                                return ip_info
-                    except Exception:
-                        pass
+                    for scheme in ("https", "http"):
+                        try:
+                            ssl_arg = False if scheme == "https" else None
+                            async with session.get(
+                                f"{scheme}://{ip}/",
+                                headers={'Host': domain},
+                                ssl=ssl_arg,
+                                allow_redirects=False,
+                            ) as resp:
+                                if resp.status >= 500:
+                                    continue
 
-                    # Try HTTP
-                    try:
-                        async with session.get(
-                            f"http://{ip}/",
-                            headers={'Host': domain}
-                        ) as resp:
-                            if resp.status < 500:
-                                ip_info['validated'] = True
-                                ip_info['http_status'] = resp.status
-                                ip_info['confidence'] = min(ip_info.get('confidence', 0.5) + 0.1, 1.0)
-                                return ip_info
-                    except Exception:
-                        pass
+                                # Check response body for hosting provider signatures
+                                try:
+                                    body = (await resp.text())[:4000].lower()
+                                except Exception:
+                                    body = ""
+
+                                # If the response body contains hosting provider branding,
+                                # this IP belongs to that provider, not our target.
+                                is_hosting = any(sig in body for sig in HOSTING_SIGNATURES)
+                                if is_hosting:
+                                    ip_info['validated'] = False
+                                    ip_info['hosting_provider_detected'] = True
+                                    # Slash confidence — this isn't the origin
+                                    ip_info['confidence'] = min(
+                                        ip_info.get('confidence', 0.5) * 0.3, 0.15
+                                    )
+                                    return ip_info
+
+                                # Real validation: the response should reference the
+                                # target domain or return meaningful content.
+                                domain_in_response = (
+                                    domain in body
+                                    or domain in str(resp.headers).lower()
+                                    or resp.status in (200, 301, 302, 403)
+                                )
+                                if domain_in_response:
+                                    ip_info['validated'] = True
+                                    ip_info[f'{scheme}_status'] = resp.status
+                                    boost = 0.2 if domain in body else 0.05
+                                    ip_info['confidence'] = min(
+                                        ip_info.get('confidence', 0.5) + boost, 1.0
+                                    )
+                                    return ip_info
+                        except Exception:
+                            pass
 
             except Exception:
                 pass
 
-            # Return anyway with lower confidence
+            # No response or no match — unvalidated
             ip_info['validated'] = False
             return ip_info
 
@@ -721,9 +827,27 @@ class OriginIPDiscovery:
             return False
 
     def _is_cdn_ip(self, ip: str) -> bool:
-        """Check if IP belongs to known CDN ranges"""
-        all_cdn_ranges = CLOUDFLARE_IP_RANGES + AKAMAI_IP_RANGES + FASTLY_IP_RANGES
-        return self._ip_in_ranges(ip, all_cdn_ranges)
+        """Check if IP belongs to known CDN or hosting provider ranges.
+
+        Hosting provider IPs (Shopify, Heroku, GitHub Pages, etc.) are shared
+        infrastructure — they're never the target's true origin.
+        """
+        all_excluded = (
+            CLOUDFLARE_IP_RANGES + AKAMAI_IP_RANGES + FASTLY_IP_RANGES
+            + HOSTING_PROVIDER_RANGES
+        )
+        return self._ip_in_ranges(ip, all_excluded)
+
+    def _is_third_party_subdomain(self, subdomain: str, base_domain: str) -> bool:
+        """Check if a subdomain likely points to third-party SaaS, not origin.
+
+        e.g. shop.kick.com → Shopify, mail.kick.com → Google/O365
+        """
+        # Strip the base domain to get the prefix
+        sub = subdomain.lower().replace(f".{base_domain}", "").strip(".")
+        # Get just the leftmost label
+        prefix = sub.split(".")[0] if sub else ""
+        return prefix in THIRD_PARTY_SUBDOMAIN_PREFIXES
 
     def _ip_in_ranges(self, ip: str, ranges: List[str]) -> bool:
         """Check if IP falls within any of the given CIDR ranges"""

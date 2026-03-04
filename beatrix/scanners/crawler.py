@@ -157,12 +157,15 @@ class TargetCrawler:
         else:
             print(f"[crawler] {message}")
 
-    async def crawl(self, target: str) -> CrawlResult:
+    async def crawl(self, target: str, auth=None) -> CrawlResult:
         """
         Crawl the target and build the attack surface.
 
         Args:
             target: URL or domain to crawl
+            auth: Optional AuthCredentials — when provided, the crawler
+                  sends auth headers/cookies on every request so it can
+                  discover authenticated pages (dashboards, settings, APIs).
 
         Returns:
             CrawlResult with all discovered data
@@ -177,18 +180,25 @@ class TargetCrawler:
         parsed = urlparse(target)
         result.base_url = f"{parsed.scheme}://{parsed.netloc}"
 
+        # ── Build auth-aware headers and cookies ────────────────────────
+        client_headers = {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        client_cookies = {}
+        if auth:
+            if hasattr(auth, 'merged_headers'):
+                client_headers.update(auth.merged_headers())
+            if hasattr(auth, 'cookies') and auth.cookies:
+                client_cookies = dict(auth.cookies)
+
         async with httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=self.follow_redirects,
             verify=False,
-            headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                # Do NOT set Accept-Encoding — httpx handles this automatically.
-                # Manually setting it causes some servers (Pinterest, etc.) to serve
-                # stripped/compressed responses that httpx then can't decompress.
-            },
+            cookies=client_cookies,
+            headers=client_headers,
         ) as client:
             # Initial fetch
             self.log(f"Fetching {target}")

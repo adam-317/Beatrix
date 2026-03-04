@@ -117,9 +117,14 @@ class KatanaRunner(ExternalTool):
 
     BINARY_NAME = "katana"
 
-    async def crawl(self, url: str, depth: int = 3, js_crawl: bool = True) -> Dict[str, Any]:
+    async def crawl(self, url: str, depth: int = 3, js_crawl: bool = True,
+                   custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Crawl a target and return discovered URLs, JS endpoints, and forms.
+
+        Args:
+            custom_headers: Optional dict of HTTP headers to send on every
+                request (e.g. {"Cookie": "session=abc"} for authenticated crawling).
 
         Returns:
             {urls: [...], js_urls: [...], form_urls: [...]}
@@ -134,6 +139,9 @@ class KatanaRunner(ExternalTool):
         ]
         if js_crawl:
             cmd.extend(["-jc"])  # JavaScript crawling
+        if custom_headers:
+            for key, value in custom_headers.items():
+                cmd.extend(["-H", f"{key}: {value}"])
 
         output = await self._run(cmd)
         lines = self._parse_lines(output)
@@ -219,9 +227,14 @@ class GospiderRunner(ExternalTool):
 
     BINARY_NAME = "gospider"
 
-    async def spider(self, url: str, depth: int = 2) -> Dict[str, Any]:
+    async def spider(self, url: str, depth: int = 2,
+                     custom_headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
         """
         Spider a target and return discovered assets.
+
+        Args:
+            custom_headers: Optional dict of HTTP headers to send on every
+                request (e.g. {"Cookie": "session=abc"} for authenticated crawling).
 
         Returns:
             {urls: [...], subdomains: [...], js_files: [...], forms: [...]}
@@ -235,6 +248,9 @@ class GospiderRunner(ExternalTool):
             "-t", "5",       # Threads
             "--timeout", "10",
         ]
+        if custom_headers:
+            for key, value in custom_headers.items():
+                cmd.extend(["-H", f"{key}: {value}"])
 
         output = await self._run(cmd)
         urls = set()

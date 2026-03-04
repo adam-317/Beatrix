@@ -420,14 +420,225 @@ class PacketCrafter:
 
         if syn == "open" and ack == "filtered":
             results["_analysis"] = "Stateful firewall detected (SYN passes, ACK blocked)"
+            results["_type"] = "stateful"
         elif syn == "filtered" and fin == "open|filtered":
             results["_analysis"] = "Packet-filtering firewall (SYN blocked, FIN not rejected)"
+            results["_type"] = "stateless"
         elif syn == "open" and ack == "unfiltered":
             results["_analysis"] = "No stateful firewall / minimal filtering"
+            results["_type"] = "none"
         else:
             results["_analysis"] = "Mixed responses — inspect individual probe results"
+            results["_type"] = "mixed"
 
         return results
+
+    # ---- Firewall bypass techniques (NETWORK_GAMEPLAN Phase 2) ----
+
+    async def source_port_bypass(
+        self, target: str, port: int,
+        source_ports: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Test if firewall allows traffic from 'trusted' source ports.
+
+        Sends SYN packets from common trusted service ports (DNS=53, HTTP=80,
+        HTTPS=443, Kerberos=88, FTP-data=20). If a filtered port responds
+        to one of these source ports, the firewall has a **reportable misconfig**.
+
+        Returns list of bypass results with source_port + inference.
+        """
+        if source_ports is None:
+            source_ports = [53, 80, 443, 88, 20]
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._source_port_bypass_sync, target, port, source_ports,
+        )
+
+    def _source_port_bypass_sync(
+        self, target: str, port: int, source_ports: List[int],
+    ) -> List[Dict[str, Any]]:
+        import time
+        results = []
+        for sport in source_ports:
+            pkt = IP(dst=target) / TCP(sport=sport, dport=port, flags="S")
+            start = time.monotonic()
+            resp = sr1(pkt, timeout=self.timeout, verbose=0)
+            rtt = (time.monotonic() - start) * 1000
+
+            entry: Dict[str, Any] = {
+                "source_port": sport,
+                "target_port": port,
+                "rtt_ms": round(rtt, 2),
+                "bypass": False,
+                "inference": "filtered",
+            }
+
+            if resp is not None and resp.haslayer(TCP):
+                tcp = resp[TCP]
+                if tcp.flags == 0x12:  # SYN-ACK
+                    entry["inference"] = "open"
+                    entry["bypass"] = True
+                elif tcp.flags & 0x04:  # RST
+                    entry["inference"] = "closed"
+                entry["flags"] = str(tcp.flags)
+                entry["ttl"] = resp.ttl
+            elif resp is not None and resp.haslayer(ICMP):
+                icmp = resp[ICMP]
+                if icmp.type == 3:
+                    entry["inference"] = "filtered"
+
+            results.append(entry)
+        return results
+
+    async def fragment_bypass(
+        self, target: str, port: int,
+        fragment_sizes: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Test if firewall fails to reassemble IP fragments.
+
+        Sends fragmented SYN packets with different MTU sizes. If a filtered
+        port responds to fragmented traffic, the firewall doesn't reassemble
+        fragments — a **reportable misconfig**.
+
+        Returns list of fragment test results.
+        """
+        if fragment_sizes is None:
+            fragment_sizes = [8, 16, 24]  # Tiny fragments that split TCP header
+
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._fragment_bypass_sync, target, port, fragment_sizes,
+        )
+
+    def _fragment_bypass_sync(
+        self, target: str, port: int, fragment_sizes: List[int],
+    ) -> List[Dict[str, Any]]:
+        import time
+        from scapy.all import fragment as scapy_fragment
+
+        results = []
+        for frag_size in fragment_sizes:
+            pkt = IP(dst=target) / TCP(dport=port, sport=int(RandShort()), flags="S")
+
+            entry: Dict[str, Any] = {
+                "fragment_size": frag_size,
+                "target_port": port,
+                "bypass": False,
+                "inference": "filtered",
+            }
+
+            try:
+                frags = scapy_fragment(pkt, fragsize=frag_size)
+                start = time.monotonic()
+                # Send all fragments, listen for response
+                for f in frags:
+                    resp = sr1(f, timeout=self.timeout, verbose=0)
+                    if resp is not None:
+                        break
+                rtt = (time.monotonic() - start) * 1000
+                entry["rtt_ms"] = round(rtt, 2)
+                entry["fragments_sent"] = len(frags)
+
+                if resp is not None and resp.haslayer(TCP):
+                    tcp = resp[TCP]
+                    if tcp.flags == 0x12:  # SYN-ACK
+                        entry["inference"] = "open"
+                        entry["bypass"] = True
+                    elif tcp.flags & 0x04:
+                        entry["inference"] = "closed"
+                    entry["flags"] = str(tcp.flags)
+            except Exception as e:
+                entry["error"] = str(e)
+
+            results.append(entry)
+        return results
+
+    async def ttl_map(
+        self, target: str, port: int = 80,
+        max_hops: int = 30,
+    ) -> Dict[str, Any]:
+        """Map the network path to locate the firewall hop.
+
+        Sends SYN packets with incrementing TTL values. The hop where
+        responses change from ICMP time-exceeded to filtered/RST reveals
+        the firewall position.
+
+        Returns dict with hops list and firewall_hop estimate.
+        """
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self._ttl_map_sync, target, port, max_hops,
+        )
+
+    def _ttl_map_sync(
+        self, target: str, port: int, max_hops: int,
+    ) -> Dict[str, Any]:
+        import time
+        hops: List[Dict[str, Any]] = []
+        firewall_hop = None
+
+        try:
+            resolved = socket.gethostbyname(target)
+        except socket.gaierror:
+            return {"hops": [], "firewall_hop": None, "error": "DNS resolution failed"}
+
+        prev_was_icmp = True
+        for ttl_val in range(1, max_hops + 1):
+            pkt = IP(dst=target, ttl=ttl_val) / TCP(dport=port, flags="S")
+            start = time.monotonic()
+            resp = sr1(pkt, timeout=self.timeout, verbose=0)
+            rtt = (time.monotonic() - start) * 1000
+
+            hop: Dict[str, Any] = {
+                "ttl": ttl_val,
+                "rtt_ms": round(rtt, 2),
+                "response": "timeout",
+            }
+
+            if resp is None:
+                hop["response"] = "timeout"
+                # Transition from ICMP to timeout = possible firewall
+                if prev_was_icmp and firewall_hop is None:
+                    firewall_hop = ttl_val
+                prev_was_icmp = False
+            elif resp.haslayer(ICMP):
+                icmp = resp[ICMP]
+                if icmp.type == 11:  # Time exceeded
+                    hop["response"] = "time-exceeded"
+                    hop["ip"] = resp.src
+                    try:
+                        hop["hostname"] = socket.gethostbyaddr(resp.src)[0]
+                    except (socket.herror, socket.gaierror):
+                        hop["hostname"] = ""
+                    prev_was_icmp = True
+                elif icmp.type == 3:  # Destination unreachable
+                    hop["response"] = "unreachable"
+                    hop["ip"] = resp.src
+                    if prev_was_icmp and firewall_hop is None:
+                        firewall_hop = ttl_val
+                    prev_was_icmp = False
+            elif resp.haslayer(TCP):
+                tcp = resp[TCP]
+                if tcp.flags == 0x12:  # SYN-ACK → reached target
+                    hop["response"] = "syn-ack"
+                    hop["ip"] = resp.src
+                    hop["is_target"] = True
+                    hops.append(hop)
+                    break
+                elif tcp.flags & 0x04:  # RST
+                    hop["response"] = "rst"
+                    hop["ip"] = resp.src
+
+            hops.append(hop)
+
+        return {
+            "hops": hops,
+            "firewall_hop": firewall_hop,
+            "total_hops": len(hops),
+            "target": target,
+            "port": port,
+        }
 
     # ---- TLS probe ----
 

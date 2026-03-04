@@ -1,30 +1,29 @@
 """
-BEATRIX Nuclei Scanner Wrapper
+BEATRIX Nuclei Scanner — Intelligent Template Engine
 
-Wraps the nuclei binary to integrate its massive template library
-into Beatrix's scanning pipeline.
+Full-featured nuclei integration with:
+1. Authenticated scanning — passes auth headers/cookies via -H flags
+2. Workflow support — runs nuclei workflows for detected technologies
+3. Custom templates — loads user templates from ~/.beatrix/nuclei-templates/
+4. Headless browser — DOM XSS/prototype pollution via -headless mode
+5. Intelligent tag selection — tech-aware inclusion + exclude-tags
+6. Interactsh integration — passes Beatrix OOB domain via -iserver
+7. Network port scanning — feeds non-HTTP services for protocol checks
+8. Split-phase execution — fast recon (Phase 1) + full exploit (Phase 4)
+9. Per-host rate limiting — -rl flag prevents WAF blocks
+10. External template repos — auto-fetches bug-bounty focused templates
 
-Nuclei has 12,600+ templates covering:
-- CVEs, default logins, exposed panels
-- Misconfigurations, technologies, takeovers
-- WAF detection, tokens, fuzzing, OAST
-- Cloud misconfigs, API exposure, secrets
+Template Sources (auto-updated):
+- Official nuclei-templates (ProjectDiscovery community)
+- projectdiscovery/fuzzing-templates (DAST-style active fuzzing)
+- User custom templates (~/.beatrix/nuclei-templates/)
 
-This wrapper:
-1. Checks that nuclei binary exists
-2. Ensures templates are downloaded and fresh (auto-update >7 days)
-3. Builds dynamic tag filters from detected technologies
-4. Runs nuclei with JSONL output, streaming findings in real time
-5. Captures stderr for progress logging
-6. Parses each finding into Beatrix Finding objects
-7. Maps nuclei severity to Bugcrowd VRT-aligned severity
-
-Timeout strategy:
-- Wall-clock timeout scales with URL count (base 600s + 0.5s per URL)
-- Per-line readline timeout is generous (120s) so nuclei isn't killed
-  during slow template batches that produce no output for a while
-- The kill chain's own SCANNER_TIMEOUT (300s) is the outer bound;
-  nuclei's internal timeout is capped to not exceed it
+Architecture:
+- scan_recon(): Phase 1 — fast tech/panel/WAF detection
+- scan_exploit(): Phase 4 — full CVE/exploit run with workflows
+- scan_network(): Phase 1 — network protocol templates on discovered ports
+- scan_headless(): Phase 4 — DOM-based checks with headless chromium
+- scan(): Default entry — runs exploit pass (backward compatible)
 """
 
 import asyncio
@@ -52,29 +51,30 @@ NUCLEI_SEVERITY_MAP = {
 
 class NucleiScanner(BaseScanner):
     """
-    Nuclei template scanner — wraps the nuclei binary.
+    Nuclei template scanner — intelligent, multi-phase, authenticated.
 
-    Runs nuclei's 8000+ community templates against the target
-    and converts results to Beatrix findings.
-
-    Dynamic template selection:
-    - Base tags always run (misconfig, exposure, cve, etc.)
-    - Technology-specific tags added based on crawler fingerprint
-    - Templates auto-updated if stale (>7 days)
+    Operates in multiple modes:
+    - RECON: Fast tech/panel/WAF detection (~60s, info/low only)
+    - EXPLOIT: Full CVE/exploit scan (~15min, all severities)
+    - NETWORK: Protocol-specific checks on non-HTTP services
+    - HEADLESS: DOM-based checks via headless chromium
+    - WORKFLOW: Technology-specific multi-step attack chains
     """
 
     name = "nuclei"
     description = "Nuclei template scanner — CVEs, misconfigs, exposed panels, takeovers"
-    version = "2.0.0"
+    version = "3.0.0"
 
-    # Map detected technologies to nuclei template tags
+    # ─────────────────────────────────────────────────────────────────────
+    # Technology → nuclei tag mapping (used for BOTH inclusion and exclusion)
+    # ─────────────────────────────────────────────────────────────────────
     TECH_TAG_MAP = {
         # Web servers
         "nginx": ["nginx"],
         "apache": ["apache", "httpd"],
         "iis": ["iis", "microsoft"],
         "caddy": ["caddy"],
-        "tomcat": ["tomcat", "apache"],
+        "tomcat": ["tomcat"],
         "lighttpd": ["lighttpd"],
         # CMS / Frameworks
         "wordpress": ["wordpress", "wp-plugin", "wp-theme"],
@@ -84,12 +84,13 @@ class NucleiScanner(BaseScanner):
         "shopify": ["shopify"],
         "ghost": ["ghost"],
         "hugo": ["hugo"],
+        "woocommerce": ["woocommerce", "wordpress"],
         # Languages / Runtimes
         "php": ["php"],
         "asp.net": ["asp", "dotnet", "microsoft"],
-        "java": ["java", "spring"],
+        "java": ["java"],
         "spring": ["spring", "springboot"],
-        "python": ["python", "django", "flask"],
+        "python": ["python"],
         "django": ["django"],
         "flask": ["flask"],
         "laravel": ["laravel", "php"],
@@ -98,6 +99,9 @@ class NucleiScanner(BaseScanner):
         "node": ["nodejs"],
         "next.js": ["nextjs"],
         "nuxt": ["nuxt"],
+        "react": ["react"],
+        "angular": ["angular"],
+        "vue": ["vue"],
         # Infrastructure
         "cloudflare": ["cloudflare"],
         "aws": ["aws", "amazon"],
@@ -114,7 +118,7 @@ class NucleiScanner(BaseScanner):
         "kubernetes": ["kubernetes", "k8s"],
         "traefik": ["traefik"],
         "consul": ["consul"],
-        "vault": ["vault"],
+        "vault": ["vault", "hashicorp"],
         "minio": ["minio"],
         "redis": ["redis"],
         "mongodb": ["mongodb"],
@@ -123,24 +127,100 @@ class NucleiScanner(BaseScanner):
         "rabbitmq": ["rabbitmq"],
         "kafka": ["kafka"],
         "solr": ["solr"],
+        "jira": ["jira", "atlassian"],
+        "confluence": ["confluence", "atlassian"],
+        "bitbucket": ["bitbucket", "atlassian"],
+        "sonarqube": ["sonarqube"],
+        "harbor": ["harbor"],
+        "airflow": ["airflow"],
+        "superset": ["superset"],
     }
+
+    # Technologies that have nuclei workflow files
+    WORKFLOW_TECH_MAP = {
+        "wordpress": "wordpress-workflow.yaml",
+        "joomla": "joomla-workflow.yaml",
+        "drupal": "drupal-workflow.yaml",
+        "jenkins": "jenkins-workflow.yaml",
+        "gitlab": "gitlab-workflow.yaml",
+        "jira": "jira-workflow.yaml",
+        "springboot": "springboot-workflow.yaml",
+        "spring": "springboot-workflow.yaml",
+        "magento": "magento-workflow.yaml",
+        "moodle": "moodle-workflow.yaml",
+        "grafana": "grafana-workflow.yaml",
+        "airflow": "airflow-workflow.yaml",
+    }
+
+    # External template repositories to auto-fetch.
+    # Each is cloned once (--depth=1), then git-pulled if >7 days stale.
+    # All clones run in parallel on first invocation.
+    #
+    # NOTE: Do NOT add projectdiscovery/nuclei-templates here — it's already
+    # managed separately via `nuclei -update-templates` (~/nuclei-templates/).
+    TEMPLATE_REPOS = [
+        {
+            "name": "fuzzing-templates",
+            "url": "https://github.com/projectdiscovery/fuzzing-templates",
+            "dir": "fuzzing-templates",
+            "description": "DAST-style active fuzzing templates (ProjectDiscovery)",
+        },
+        {
+            "name": "cent-nuclei-templates",
+            "url": "https://github.com/xm1k3/cent-nuclei-templates",
+            "dir": "cent-nuclei-templates",
+            "description": "Community-curated templates aggregated from 100+ repos",
+        },
+        {
+            "name": "nuclei-templates-pikpikcu",
+            "url": "https://github.com/pikpikcu/nuclei-templates",
+            "dir": "nuclei-templates-pikpikcu",
+            "description": "Bug bounty focused CVE and exploit templates",
+        },
+        {
+            "name": "kenzer-templates",
+            "url": "https://github.com/ARPSyndicate/kenzer-templates",
+            "dir": "kenzer-templates",
+            "description": "KENZER recon & exploit templates — subdomain takeover, misconfigs",
+        },
+    ]
 
     def __init__(self, config: Optional[Dict] = None):
         super().__init__(config)
         self.nuclei_path = self._find_nuclei()
-        # Base timeout — scaled dynamically by _calculate_timeout() based on
-        # URL count.  600s (10 min) is reasonable for a few hundred URLs.
+
+        # Timeouts
         self._base_timeout = self.config.get("nuclei_timeout", 600)
         self.timeout_seconds = self._base_timeout
+
+        # URL lists for different scan modes
         self._urls_to_scan: List[str] = []
-        # Include info severity — nuclei info templates detect tech, panels,
-        # WAFs, exposed configs, and other recon-valuable data.
+        self._network_targets: List[str] = []  # host:port for network scans
+
+        # Severity filter
         self._severity_filter = self.config.get(
             "nuclei_severity", "critical,high,medium,low,info"
         )
+
+        # Detected technologies
         self._detected_technologies: List[str] = []
+
+        # Template directories
         self._template_dir = Path.home() / "nuclei-templates"
+        self._custom_template_dir = Path.home() / ".beatrix" / "nuclei-templates"
+        self._extra_template_dirs: List[Path] = []
         self._templates_verified = False
+
+        # Auth credentials (set by kill chain via set_auth())
+        self._auth_headers: List[str] = []  # ["-H", "Cookie: ...", "-H", "Auth: ..."]
+
+        # Interactsh configuration
+        self._interactsh_server: Optional[str] = None
+        self._interactsh_token: Optional[str] = None
+
+        # Rate limiting
+        self._rate_limit = self.config.get("nuclei_rate_limit", 150)
+        self._rate_limit_per_host = self.config.get("nuclei_rate_limit_per_host", 50)
 
     def _find_nuclei(self) -> Optional[str]:
         """Find nuclei binary on PATH"""
@@ -159,11 +239,26 @@ class NucleiScanner(BaseScanner):
     def available(self) -> bool:
         return self.nuclei_path is not None
 
-    async def _ensure_templates(self) -> bool:
-        """Ensure nuclei templates are installed and reasonably fresh.
+    @staticmethod
+    def _dir_has_yaml(d: Path) -> bool:
+        """Fast check: does directory contain at least one .yaml file?
 
-        Auto-updates if templates are missing or >7 days old.
-        Returns True if templates are available, False otherwise.
+        Uses next() with a generator instead of building a full list,
+        so it short-circuits on the first match.
+        """
+        try:
+            next(d.glob("**/*.yaml"))
+            return True
+        except StopIteration:
+            return False
+
+    async def _ensure_templates(self) -> bool:
+        """Ensure all template sources are installed and fresh.
+
+        Manages:
+        1. Official nuclei-templates (auto-update > 7 days)
+        2. External repos (fuzzing-templates, etc.)
+        3. Custom user templates directory
         """
         if self._templates_verified:
             return True
@@ -171,11 +266,33 @@ class NucleiScanner(BaseScanner):
         if not self.nuclei_path:
             return False
 
-        # Check if templates directory exists and has content
+        # 1. Official templates
+        await self._update_official_templates()
+
+        # 2. External template repos
+        await self._update_external_repos()
+
+        # 3. Custom user templates
+        self._setup_custom_templates()
+
+        # Count available templates
+        yaml_count = sum(1 for _ in self._template_dir.glob("**/*.yaml")) if self._template_dir.exists() else 0
+        extra_count = sum(
+            sum(1 for _ in d.glob("**/*.yaml"))
+            for d in self._extra_template_dirs if d.exists()
+        )
+        custom_count = sum(1 for _ in self._custom_template_dir.glob("**/*.yaml")) if self._custom_template_dir.exists() else 0
+
+        self.log(f"Templates: {yaml_count} official + {extra_count} external + {custom_count} custom")
+        self._templates_verified = yaml_count > 0
+        return self._templates_verified
+
+    async def _update_official_templates(self) -> None:
+        """Update official nuclei-templates if missing or stale (>7 days)."""
         template_marker = self._template_dir / ".checksum"
         needs_update = False
 
-        if not self._template_dir.exists() or not any(self._template_dir.glob("**/*.yaml")):
+        if not self._template_dir.exists() or not self._dir_has_yaml(self._template_dir):
             self.log("Nuclei templates not found — downloading...")
             needs_update = True
         elif template_marker.exists():
@@ -183,9 +300,6 @@ class NucleiScanner(BaseScanner):
             if age_days > 7:
                 self.log(f"Nuclei templates are {age_days:.0f} days old — updating...")
                 needs_update = True
-        else:
-            # Templates exist but no checksum — count them
-            pass
 
         if needs_update:
             try:
@@ -194,33 +308,115 @@ class NucleiScanner(BaseScanner):
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
                 )
-                await asyncio.wait_for(proc.communicate(), timeout=60)
+                await asyncio.wait_for(proc.communicate(), timeout=120)
                 self.log("Nuclei templates updated")
             except (asyncio.TimeoutError, Exception) as e:
                 self.log(f"Template update failed: {e} — proceeding with existing")
 
-        # Count available templates
-        yaml_count = sum(1 for _ in self._template_dir.glob("**/*.yaml")) if self._template_dir.exists() else 0
-        self.log(f"Nuclei templates available: {yaml_count}")
-        self._templates_verified = yaml_count > 0
-        return self._templates_verified
+    async def _update_external_repos(self) -> None:
+        """Clone/update external template repositories in parallel.
+
+        Each repo is shallow-cloned on first run, then git-pulled if >7 days
+        stale.  All clone/update operations run concurrently so first-run
+        cost is ~2 min total instead of ~2 min × N repos.
+        """
+        base_dir = Path.home() / ".beatrix" / "external-templates"
+        base_dir.mkdir(parents=True, exist_ok=True)
+
+        async def _process_repo(repo: dict) -> Optional[Path]:
+            """Clone or update a single repo. Returns repo_dir on success."""
+            repo_dir = base_dir / repo["dir"]
+            try:
+                if repo_dir.exists() and (repo_dir / ".git").exists():
+                    # Update if > 7 days old
+                    age_marker = repo_dir / ".last_update"
+                    needs_update = True
+                    if age_marker.exists():
+                        age_days = (time.time() - age_marker.stat().st_mtime) / 86400
+                        needs_update = age_days > 7
+
+                    if needs_update:
+                        proc = await asyncio.create_subprocess_exec(
+                            "git", "-C", str(repo_dir), "pull", "--quiet",
+                            stdout=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        ret = await asyncio.wait_for(proc.communicate(), timeout=60)
+                        age_marker.touch()
+                        self.log(f"Updated {repo['name']}")
+                    # else: already fresh, no action needed
+                else:
+                    # Clone
+                    self.log(f"Cloning {repo['name']}...")
+                    proc = await asyncio.create_subprocess_exec(
+                        "git", "clone", "--depth=1", repo["url"], str(repo_dir),
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    _, stderr = await asyncio.wait_for(proc.communicate(), timeout=180)
+                    if proc.returncode != 0:
+                        err_text = stderr.decode("utf-8", errors="replace").strip() if stderr else "unknown error"
+                        self.log(f"Clone failed for {repo['name']}: {err_text}")
+                        return repo_dir if repo_dir.exists() else None
+                    (repo_dir / ".last_update").touch()
+                    self.log(f"Cloned {repo['name']}")
+
+                return repo_dir if repo_dir.exists() else None
+            except asyncio.TimeoutError:
+                self.log(f"Timeout cloning/updating {repo['name']} — skipping")
+                return repo_dir if repo_dir.exists() else None
+            except Exception as e:
+                self.log(f"External repo {repo['name']}: {e}")
+                return repo_dir if repo_dir.exists() else None
+
+        # Run all repo operations in parallel
+        results = await asyncio.gather(
+            *[_process_repo(repo) for repo in self.TEMPLATE_REPOS],
+            return_exceptions=True,
+        )
+
+        seen = set()
+        for result in results:
+            if isinstance(result, Exception):
+                self.log(f"Repo task failed: {result}")
+                continue
+            if result and result.exists() and str(result) not in seen:
+                if self._dir_has_yaml(result):
+                    seen.add(str(result))
+                    self._extra_template_dirs.append(result)
+                else:
+                    self.log(f"Skipping {result.name} — no .yaml templates found")
+
+        if self._extra_template_dirs:
+            self.log(f"External template sources: {len(self._extra_template_dirs)} repos loaded")
+
+    def _setup_custom_templates(self) -> None:
+        """Ensure custom templates directory exists for user extensions."""
+        self._custom_template_dir.mkdir(parents=True, exist_ok=True)
+        readme = self._custom_template_dir / "README.md"
+        if not readme.exists():
+            readme.write_text(
+                "# Custom Nuclei Templates\n\n"
+                "Place your custom nuclei YAML templates here.\n"
+                "They will be automatically loaded during scans.\n\n"
+                "Template syntax: https://docs.projectdiscovery.io/templates/introduction\n"
+            )
 
     async def diagnostics(self) -> Dict:
-        """Run nuclei diagnostics — verify binary, templates, and version.
-
-        Use this to verify nuclei is working correctly:
-            scanner = NucleiScanner()
-            diag = await scanner.diagnostics()
-            print(diag)
-        """
+        """Run nuclei diagnostics — verify binary, templates, version, and features."""
         result = {
             "binary": self.nuclei_path,
             "available": self.available,
             "version": None,
             "template_dir": str(self._template_dir),
+            "custom_template_dir": str(self._custom_template_dir),
+            "extra_template_dirs": [str(d) for d in self._extra_template_dirs],
             "template_count": 0,
-            "templates_by_severity": {},
-            "tags_available": [],
+            "custom_template_count": 0,
+            "workflows_available": [],
+            "detected_technologies": self._detected_technologies,
+            "auth_configured": bool(self._auth_headers),
+            "interactsh_configured": bool(self._interactsh_server),
         }
 
         if not self.nuclei_path:
@@ -240,85 +436,143 @@ class NucleiScanner(BaseScanner):
         except Exception as e:
             result["version"] = f"error: {e}"
 
-        # Count templates by type
+        # Count templates
         if self._template_dir.exists():
-            for yaml_file in self._template_dir.glob("**/*.yaml"):
-                result["template_count"] += 1
-                parent = yaml_file.parent.name
-                result["templates_by_severity"][parent] = (
-                    result["templates_by_severity"].get(parent, 0) + 1
-                )
+            result["template_count"] = sum(1 for _ in self._template_dir.glob("**/*.yaml"))
+        if self._custom_template_dir.exists():
+            result["custom_template_count"] = sum(1 for _ in self._custom_template_dir.glob("**/*.yaml"))
 
-        # Ensure templates are fresh
+        result["workflows_available"] = self._find_workflows()
+
         await self._ensure_templates()
-
         return result
+
+    # =====================================================================
+    # CONFIGURATION SETTERS (called by kill chain)
+    # =====================================================================
 
     def add_urls(self, urls: List[str]) -> None:
         """Add URLs to scan — called by kill chain to feed discovered URLs."""
         self._urls_to_scan.extend(urls)
 
-    def set_technologies(self, technologies) -> None:
-        """Set detected technologies for dynamic template selection.
+    def add_network_targets(self, targets: List[str]) -> None:
+        """Add network targets (host:port) for protocol scanning."""
+        self._network_targets.extend(targets)
 
-        Accepts either a list of strings or a dict (keys are tech names).
-        """
+    def set_technologies(self, technologies) -> None:
+        """Set detected technologies for dynamic template selection."""
         if isinstance(technologies, dict):
             self._detected_technologies = [t.lower() for t in technologies.keys()]
         else:
             self._detected_technologies = [t.lower() for t in technologies]
 
-    def _calculate_timeout(self, url_count: int) -> int:
-        """Calculate wall-clock timeout based on URL count.
+    def set_auth(self, auth_headers: List[str]) -> None:
+        """Set authentication headers for authenticated scanning.
 
-        Base is 600s.  Add 0.5s per URL beyond 100 to give nuclei
-        enough time for large scans.  Capped at 1800s (30 min).
+        Args:
+            auth_headers: List of ["-H", "Header: Value", ...] flags
         """
-        extra = max(0, url_count - 100) * 0.5
-        return min(int(self._base_timeout + extra), 1800)
+        self._auth_headers = auth_headers
 
-    def _build_tags(self) -> str:
-        """Build nuclei tag filter based on detected technologies.
+    def set_interactsh(self, server: Optional[str] = None, token: Optional[str] = None) -> None:
+        """Configure interactsh for OOB detection unification."""
+        self._interactsh_server = server
+        self._interactsh_token = token
 
-        Uses a comprehensive base set that covers every high-value template
-        category in nuclei-templates.  Technology-specific tags are added
-        on top based on the crawler's fingerprint.
+    # =====================================================================
+    # TAG & TEMPLATE INTELLIGENCE
+    # =====================================================================
+
+    def _build_recon_tags(self) -> str:
+        """Build tags for Phase 1 recon pass — fast tech/panel/WAF detection.
+
+        Covers: technology fingerprinting, exposed panels, misconfigs,
+        leaked files/env, SSL/TLS issues, DNS issues, CORS, proxy.
+        These are all low-risk checks that gather intel for Phase 4.
         """
-        # Comprehensive base tags — covers all major template categories.
-        # These use OR logic: a template matching ANY of these tags will run.
         tags = {
-            # Vulnerability classes
-            "cve", "rce", "lfi", "xss", "sqli", "ssrf", "idor",
-            "xxe", "ssti", "cmdi", "traversal",
+            # Tech fingerprinting
+            "tech", "detect", "panel", "waf", "fingerprint", "favicon",
             # Misconfigurations & exposure
             "misconfig", "exposure", "config", "disclosure",
-            "unauth", "default-login", "login",
-            # Secrets & tokens
-            "token", "secret", "api", "apikey", "keys",
-            # Takeover & DNS
-            "takeover", "dns",
-            # Panels & admin
-            "panel", "admin", "dashboard",
-            # File & upload
-            "fileupload", "file", "backup",
-            # Cookies & headers
-            "cookies", "cookie", "headers",
-            # Redirect & injection
-            "redirect", "injection", "intrusive",
-            # Cloud
+            "default-login", "unauth",
+            # Leaked files & secrets
+            "git", "env", "backup", "debug", "log",
+            # API surface
+            "swagger", "openapi",
+            # SSL/TLS & transport
+            "ssl", "tls",
+            # DNS
+            "dns", "zone-transfer",
+            # Proxy issues
+            "proxy",
+            # CORS (recon-safe: just checks headers)
+            "cors",
+            # Cache (detect cache-related headers/behavior)
+            "cache",
+        }
+        for tech in self._detected_technologies:
+            tech_lower = tech.lower().strip()
+            for key, tech_tags in self.TECH_TAG_MAP.items():
+                if key in tech_lower:
+                    tags.update(tech_tags)
+        return ",".join(sorted(tags))
+
+    def _build_exploit_tags(self) -> str:
+        """Build tags for Phase 4 exploit pass — CVEs and active exploitation.
+
+        Every real vulnerability class that nuclei templates use as tags.
+        This is the exhaustive list — if a vuln class tag exists in the
+        nuclei-templates repo, it should be here.
+        """
+        tags = {
+            # ── CVEs & known vulns ──
+            "cve", "cnvd", "edb",
+            # ── Injection classes ──
+            "sqli", "xss", "ssti", "cmdi", "xxe", "ssrf", "lfi",
+            "rce", "traversal", "injection",
+            "crlf",             # CRLF injection (header injection)
+            "host-header",      # Host header injection / poisoning
+            # ── Access control ──
+            "idor", "unauth", "default-login", "auth", "bruteforce",
+            "misconfig", "exposure",
+            # ── Redirect & routing ──
+            "redirect", "open-redirect",
+            # ── CORS & origin ──
+            "cors",
+            # ── Cache & web cache ──
+            "cache", "web-cache",
+            # ── Deserialization ──
+            "deserialization",
+            # ── Race conditions ──
+            "race-condition",
+            # ── Prototype pollution ──
+            "prototype-pollution",
+            # ── Secrets & tokens ──
+            "token", "secret", "api", "apikey", "keys", "creds",
+            # ── Takeover ──
+            "takeover",
+            # ── File & upload ──
+            "fileupload", "file",
+            # ── Cloud ──
             "cloud", "aws", "azure", "gcp",
-            # Detection & tech
-            "tech", "detect", "waf",
-            # Fuzzing & OAST (out-of-band)
-            "fuzz", "oast",
-            # Brute force & auth
-            "bruteforce", "auth",
-            # Misc high-value
-            "creds", "debug", "log", "logs",
-            "env", "git", "svn", "hg",
+            # ── OAST / OOB ──
+            "oast",
+            # ── SSL/TLS ──
+            "ssl", "tls",
+            # ── DNS ──
+            "dns",
+            # ── Proxy ──
+            "proxy",
+            # ── Generic catch-all (hundreds of templates use this) ──
+            "generic",
+            # ── Config & info (catch anything missed by recon) ──
+            "config", "disclosure",
+            # ── Network protocols ──
+            "network",
         }
 
-        # Add technology-specific tags based on fingerprint
+        # Add technology-specific tags
         for tech in self._detected_technologies:
             tech_lower = tech.lower().strip()
             for key, tech_tags in self.TECH_TAG_MAP.items():
@@ -327,68 +581,323 @@ class NucleiScanner(BaseScanner):
 
         return ",".join(sorted(tags))
 
-    async def scan(self, context: ScanContext) -> AsyncIterator[Finding]:
-        """Run nuclei against the target"""
-        if not self.nuclei_path:
-            self.log("nuclei binary not found — skipping (install: go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest)")
+    # Tags that should ALWAYS be excluded — never useful for bug bounty.
+    ALWAYS_EXCLUDE_TAGS = {
+        "dos",          # Denial of service — breaks targets, not a bounty finding
+        "fuzz",         # Blind fuzzing — redundant with our SmartFuzzer
+        "intrusive",    # Destructive operations (DELETE, DROP, etc.)
+    }
+
+    def _build_exclude_tags(self) -> str:
+        """Build exclude tags: always-dangerous + technologies NOT detected.
+
+        Two layers:
+        1. Always exclude: dos, fuzz, intrusive (dangerous or redundant)
+        2. CMS exclusion: if WordPress detected, skip Joomla/Drupal/etc.
+        """
+        exclude = set(self.ALWAYS_EXCLUDE_TAGS)
+
+        if self._detected_technologies:
+            detected_lower = {t.lower().strip() for t in self._detected_technologies}
+
+            # CMS exclusion — only exclude if we've detected a DIFFERENT CMS
+            cms_techs = {"wordpress", "joomla", "drupal", "magento", "shopify", "ghost", "hugo", "woocommerce"}
+            detected_cms = cms_techs & detected_lower
+
+            if detected_cms:
+                for cms in cms_techs - detected_cms:
+                    if cms in self.TECH_TAG_MAP:
+                        exclude.update(self.TECH_TAG_MAP[cms])
+
+            exclude.discard("php")  # Too common to exclude
+
+        return ",".join(sorted(exclude))
+
+    def _find_workflows(self) -> List[str]:
+        """Find applicable workflow files based on detected technologies."""
+        workflows = []
+        workflow_dir = self._template_dir / "workflows"
+
+        if not workflow_dir.exists():
+            return workflows
+
+        for tech in self._detected_technologies:
+            tech_lower = tech.lower().strip()
+            for key, workflow_file in self.WORKFLOW_TECH_MAP.items():
+                if key in tech_lower:
+                    wf_path = workflow_dir / workflow_file
+                    if wf_path.exists():
+                        workflows.append(str(wf_path))
+                    else:
+                        matches = list(workflow_dir.glob(f"**/{workflow_file}"))
+                        if matches:
+                            workflows.append(str(matches[0]))
+
+        return list(set(workflows))
+
+    def _calculate_timeout(self, url_count: int, mode: str = "exploit") -> int:
+        """Calculate wall-clock timeout based on URL count and mode.
+
+        No hard caps — effectiveness is the priority.  Nuclei manages its
+        own template concurrency and will finish when it's done.
+        """
+        if mode == "recon":
+            # Recon uses lightweight info/low templates — fast per URL
+            return max(180, 120 + url_count * 3)
+        elif mode == "network":
+            # Network probes are quick but need time for many services
+            return max(180, 180 + len(self._network_targets) * 5)
+        elif mode == "headless":
+            # Headless spins up a browser per URL — needs real time
+            return max(300, 120 + url_count * 30)
+        else:
+            # Exploit: full template set per URL — proportional scaling
+            extra = max(0, url_count - 50) * 2
+            return max(int(self._base_timeout), int(self._base_timeout + extra))
+
+    # =====================================================================
+    # SCAN MODES
+    # =====================================================================
+
+    async def scan_recon(self, context: ScanContext) -> AsyncIterator[Finding]:
+        """Phase 1: Fast recon scan — tech detection, panels, WAF, misconfigs.
+
+        Runs with info/low severity only, limited tags, short timeout.
+        Output feeds technology detection for later phases.
+        """
+        if not self.nuclei_path or not await self._ensure_templates():
             return
 
-        # Ensure templates are downloaded and fresh
-        if not await self._ensure_templates():
-            self.log("No nuclei templates available — skipping")
-            return
-
-        # Pick up technologies from scan context if available
         if context.extra and context.extra.get("technologies"):
             self.set_technologies(context.extra["technologies"])
 
-        # Build URL list: context URL + any additional URLs added by engine
+        urls = set()
+        urls.add(context.url)
+        urls.update(self._urls_to_scan)  # ALL URLs — effectiveness over speed
+
+        tags = self._build_recon_tags()
+        exclude_tags = self._build_exclude_tags()
+        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="recon"))
+        self.log(f"[RECON] Scanning {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+
+        cmd_extra = ["-severity", "info,low"]
+        if exclude_tags:
+            cmd_extra.extend(["-exclude-tags", exclude_tags])
+
+        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
+            yield finding
+
+    async def scan_exploit(self, context: ScanContext) -> AsyncIterator[Finding]:
+        """Phase 4: Full exploitation scan — CVEs, injections, auth bypass.
+
+        Runs all discovered URLs with full severity, technology-aware tags,
+        exclude-tags for irrelevant tech, authenticated if available.
+        """
+        if not self.nuclei_path or not await self._ensure_templates():
+            return
+
+        if context.extra and context.extra.get("technologies"):
+            self.set_technologies(context.extra["technologies"])
+
         urls = set()
         urls.add(context.url)
         urls.update(self._urls_to_scan)
 
-        # Build dynamic tags based on target fingerprint
-        tags = self._build_tags()
+        tags = self._build_exploit_tags()
+        exclude_tags = self._build_exclude_tags()
 
-        # Scale timeout based on URL count
-        self.timeout_seconds = self._calculate_timeout(len(urls))
-        self.log(f"Running nuclei on {len(urls)} URLs (timeout {self.timeout_seconds}s)")
-        self.log(f"Tags: {tags}")
+        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="exploit"))
+        self.log(f"[EXPLOIT] Scanning {len(urls)} URLs (timeout {self.timeout_seconds}s)")
 
-        # Run nuclei with JSON output
-        async for finding in self._run_nuclei(list(urls), tags):
+        cmd_extra = ["-severity", self._severity_filter]
+        if exclude_tags:
+            cmd_extra.extend(["-exclude-tags", exclude_tags])
+            self.log(f"Excluding tags: {exclude_tags}")
+
+        # Main tag-based scan
+        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
             yield finding
 
-    async def _run_nuclei(self, urls: List[str], tags: str = "") -> AsyncIterator[Finding]:
-        """Execute nuclei and stream findings"""
+        # Workflow scan — technology-specific multi-step attack chains
+        workflows = self._find_workflows()
+        if workflows:
+            self.log(f"Running {len(workflows)} workflows: {', '.join(Path(w).stem for w in workflows)}")
+            for wf in workflows:
+                async for finding in self._run_nuclei(
+                    list(urls), tags="", cmd_extra=["-w", wf, "-severity", self._severity_filter]
+                ):
+                    yield finding
+
+    async def scan_network(self, context: ScanContext) -> AsyncIterator[Finding]:
+        """Phase 1: Network protocol scanning on discovered non-HTTP ports.
+
+        Feeds host:port targets to nuclei's network templates for
+        Redis unauthenticated, MongoDB no-auth, Elasticsearch exposure, etc.
+        """
+        if not self.nuclei_path or not await self._ensure_templates():
+            return
+
+        if not self._network_targets:
+            return
+
+        self.timeout_seconds = int(self._calculate_timeout(0, mode="network"))
+        self.log(f"[NETWORK] Scanning {len(self._network_targets)} service targets")
+
+        network_template_dir = self._template_dir / "network"
+        if not network_template_dir.exists():
+            self.log("No network templates found — skipping network scan")
+            return
+
+        cmd_extra = ["-t", str(network_template_dir), "-severity", self._severity_filter]
+
+        async for finding in self._run_nuclei(
+            self._network_targets, tags="", cmd_extra=cmd_extra
+        ):
+            yield finding
+
+    async def scan_headless(self, context: ScanContext) -> AsyncIterator[Finding]:
+        """Phase 4: Headless browser scan for DOM-based vulnerabilities.
+
+        Uses nuclei's headless mode with chromium for DOM XSS,
+        prototype pollution, JS redirects, CSP bypass.
+        """
+        if not self.nuclei_path or not await self._ensure_templates():
+            return
+
+        urls = [context.url]
+        urls.extend(self._urls_to_scan)  # ALL URLs — DOM XSS hides in deep pages
+
+        self.timeout_seconds = int(self._calculate_timeout(len(urls), mode="headless"))
+        self.log(f"[HEADLESS] Scanning {len(urls)} URLs with browser mode")
+
+        headless_templates = list(self._template_dir.glob("**/headless/**/*.yaml"))
+        if not headless_templates:
+            self.log("No headless templates found — skipping")
+            return
+
+        cmd_extra = ["-headless", "-tags", "headless", "-severity", self._severity_filter]
+
+        async for finding in self._run_nuclei(list(set(urls)), tags="", cmd_extra=cmd_extra):
+            yield finding
+
+    async def scan(self, context: ScanContext) -> AsyncIterator[Finding]:
+        """Default scan entry point — runs exploit pass (backward compatible).
+
+        The kill chain calls scan_recon() and scan_exploit() separately,
+        but if nuclei is invoked standalone via 'beatrix strike -m nuclei',
+        this runs the full exploit pass.
+        """
+        if not self.nuclei_path:
+            self.log(
+                "nuclei not found — install: "
+                "go install github.com/projectdiscovery/nuclei/v3/cmd/nuclei@latest"
+            )
+            return
+
+        if not await self._ensure_templates():
+            self.log("No nuclei templates available — skipping")
+            return
+
+        if context.extra and context.extra.get("technologies"):
+            self.set_technologies(context.extra["technologies"])
+
+        # Set auth from context if available
+        if context.extra and context.extra.get("auth"):
+            auth = context.extra["auth"]
+            if hasattr(auth, "nuclei_header_flags"):
+                self.set_auth(auth.nuclei_header_flags())
+
+        urls = set()
+        urls.add(context.url)
+        urls.update(self._urls_to_scan)
+
+        tags = self._build_exploit_tags()
+        exclude_tags = self._build_exclude_tags()
+
+        self.timeout_seconds = int(self._calculate_timeout(len(urls)))
+        self.log(f"Running nuclei on {len(urls)} URLs (timeout {self.timeout_seconds}s)")
+
+        cmd_extra = ["-severity", self._severity_filter]
+        if exclude_tags:
+            cmd_extra.extend(["-exclude-tags", exclude_tags])
+
+        async for finding in self._run_nuclei(list(urls), tags, cmd_extra=cmd_extra):
+            yield finding
+
+    # =====================================================================
+    # CORE EXECUTION
+    # =====================================================================
+
+    async def _run_nuclei(
+        self,
+        targets: List[str],
+        tags: str = "",
+        cmd_extra: Optional[List[str]] = None,
+    ) -> AsyncIterator[Finding]:
+        """Execute nuclei and stream findings.
+
+        Core method called by all scan modes. Handles:
+        - URL file management
+        - Command construction (tags, auth, interactsh, rate limits)
+        - Custom + external template directories
+        - Process management and timeout
+        - Streaming JSONL parsing
+        """
         import tempfile
 
-        if not tags:
-            tags = self._build_tags()
+        if not targets:
+            return
 
-        # Write URLs to temp file for -l flag
+        if not tags:
+            tags = self._build_exploit_tags()
+
         with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-            for url in urls:
-                f.write(url + '\n')
-            url_file = f.name
+            for target in targets:
+                f.write(target + '\n')
+            target_file = f.name
 
         try:
             cmd = [
                 self.nuclei_path,
-                "-l", url_file,
-                "-jsonl",                    # JSON Lines output — findings to stdout
-                "-silent",                   # Suppress banner noise
-                "-no-color",                 # No ANSI colors in output
-                "-timeout", "15",            # Per-request timeout (seconds)
-                "-retries", "1",             # Don't retry failed requests
-                "-rate-limit", "150",        # Requests per second
-                "-bulk-size", "50",          # Concurrent templates per host
-                "-concurrency", "25",        # Concurrent hosts
-                "-severity", self._severity_filter,
-                "-tags", tags,
-                "-stats",                    # Show progress stats (stderr)
-                "-stats-interval", "15",     # Stats every 15s
+                "-l", target_file,
+                "-jsonl",
+                "-silent",
+                "-no-color",
+                "-timeout", "30",
+                "-retries", "2",
+                "-rate-limit", str(self._rate_limit),
+                "-rl", str(self._rate_limit_per_host),
+                "-bulk-size", "50",
+                "-concurrency", "25",
+                "-stats",
+                "-stats-interval", "15",
             ]
+
+            # Tags (skip if using -w workflow or -t specific dir)
+            if tags:
+                cmd.extend(["-tags", tags])
+
+            # Authentication headers
+            if self._auth_headers:
+                cmd.extend(self._auth_headers)
+
+            # Interactsh configuration
+            if self._interactsh_server:
+                cmd.extend(["-iserver", self._interactsh_server])
+                if self._interactsh_token:
+                    cmd.extend(["-itoken", self._interactsh_token])
+
+            # Custom template directories
+            if self._custom_template_dir.exists() and self._dir_has_yaml(self._custom_template_dir):
+                cmd.extend(["-t", str(self._custom_template_dir)])
+
+            # External template directories (already verified during _ensure_templates)
+            for ext_dir in self._extra_template_dirs:
+                cmd.extend(["-t", str(ext_dir)])
+
+            # Extra flags (severity, exclude-tags, -w, -headless, etc.)
+            if cmd_extra:
+                cmd.extend(cmd_extra)
 
             self.log(f"Executing: {' '.join(cmd[:5])}...")
 
@@ -501,9 +1010,8 @@ class NucleiScanner(BaseScanner):
         except Exception as e:
             self.log(f"Nuclei error: {e}")
         finally:
-            # Clean up temp file
             try:
-                Path(url_file).unlink()
+                Path(target_file).unlink()
             except Exception:
                 pass
 
@@ -554,6 +1062,14 @@ class NucleiScanner(BaseScanner):
             curl_cmd = data.get("curl-command", data.get("curl_command", ""))
             if curl_cmd:
                 evidence_parts.append(f"Reproduce: {curl_cmd}")
+
+            # Include interaction data if OOB was triggered
+            interaction = data.get("interaction", {})
+            if interaction:
+                evidence_parts.append(
+                    f"OOB Interaction: {interaction.get('protocol', 'unknown')} "
+                    f"from {interaction.get('remote-address', 'unknown')}"
+                )
 
             evidence = "\n".join(evidence_parts)
 

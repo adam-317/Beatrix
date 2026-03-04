@@ -57,7 +57,10 @@ from .xxe import XXEScanner
 # from .mobile_interceptor import MobileInterceptor     # Android traffic capture
 # from .power_injector import PowerInjector       # SQLi/XSS/CMDi advanced
 # from .browser_scanner import BrowserScanner     # Playwright-based scanning
-# from .origin_ip_discovery import OriginIPDiscovery  # WAF bypass via origin IP
+try:
+    from .origin_ip_discovery import OriginIPDiscovery  # WAF bypass via origin IP
+except ImportError:
+    OriginIPDiscovery = None  # aiohttp missing — kill_chain.py handles gracefully
 # from .polyglot_generator import PolyglotGenerator   # XSS polyglot payloads
 # from .css_exfiltrator import CSSExfiltrator     # CSS injection + exfil
 # from .idor_auth import AuthenticatedIDORScanner # Multi-role IDOR testing (AI)
@@ -113,4 +116,6 @@ __all__ = [
     "GitHubRecon",
     # GraphQL
     "GraphQLScanner",
+    # CDN Bypass
+    "OriginIPDiscovery",
 ]

@@ -3,6 +3,8 @@ config/hackerone_credentials.csv
 config/*.csv
 config/*.key
 config/*.secret
+auth.yaml
+**/auth.yaml
 
 # Python
 __pycache__/

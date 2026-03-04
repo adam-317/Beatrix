@@ -269,6 +269,7 @@ class BeatrixEngine:
         preset: str = "standard",
         ai: bool = False,
         modules: Optional[List[str]] = None,
+        auth: Optional[Any] = None,
     ) -> KillChainState:
         """
         Execute a hunt against a target.
@@ -278,6 +279,7 @@ class BeatrixEngine:
             preset: Scan preset (quick, standard, full, etc.)
             ai: Enable AI analysis
             modules: Override modules to run
+            auth: AuthCredentials object for authenticated scanning
 
         Returns:
             KillChainState with all findings
@@ -296,11 +298,16 @@ class BeatrixEngine:
         # Enable AI if requested
         self.config.ai_enabled = ai
 
+        # Build context with auth credentials
+        context = {"modules": modules}
+        if auth is not None:
+            context["auth"] = auth
+
         # Execute kill chain
         state = await self.kill_chain.execute(
             target=target,
             phases=phases,
-            context={"modules": modules},
+            context=context,
         )
 
         # Collect all findings and deduplicate

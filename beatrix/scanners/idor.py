@@ -739,6 +739,17 @@ The application may not properly validate authorization when accessing resources
         3. Comparing responses and detecting PII in leaked data
         """
 
+        # Pick up auth credentials from context if not already configured
+        auth = ctx.extra.get("auth") if ctx.extra else None
+        if auth and not self.user1_auth:
+            if hasattr(auth, "idor_user1") and auth.idor_user1:
+                self.user1_auth = auth.idor_user1.all_headers()
+            elif hasattr(auth, "all_headers"):
+                self.user1_auth = auth.all_headers()
+        if auth and not self.user2_auth:
+            if hasattr(auth, "idor_user2") and auth.idor_user2:
+                self.user2_auth = auth.idor_user2.all_headers()
+
         # Extract ID candidates from URL
         candidates = self.extract_ids_from_url(ctx.url)
 

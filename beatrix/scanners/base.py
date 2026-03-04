@@ -139,6 +139,31 @@ class BaseScanner(ABC):
             await self.client.aclose()
             self.client = None
 
+    def apply_auth(self, auth_creds) -> None:
+        """Inject authentication headers/cookies into the scanner's HTTP client.
+
+        Called by the kill chain AFTER __aenter__ (so self.client exists)
+        and BEFORE the first scan() call.  Headers are injected once and
+        persist for every subsequent request this scanner makes.
+
+        Args:
+            auth_creds: An AuthCredentials instance (or any object with
+                merged_headers() and cookie_header() methods).
+        """
+        if not auth_creds or not self.client:
+            return
+
+        # Inject headers (Authorization, X-API-Key, etc.)
+        if hasattr(auth_creds, 'merged_headers'):
+            for key, value in auth_creds.merged_headers().items():
+                self.client.headers[key] = value
+
+        # Inject cookies via the Cookie header
+        if hasattr(auth_creds, 'cookie_header'):
+            cookie_str = auth_creds.cookie_header()
+            if cookie_str:
+                self.client.headers["Cookie"] = cookie_str
+
     # =========================================================================
     # MAIN ENTRY POINTS
     # =========================================================================

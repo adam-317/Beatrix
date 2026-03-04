@@ -134,6 +134,7 @@ Think of it as unleashing the Bride on a room full of Crazy 88s.
   # Lines starting with # are comments
 
 [bold cyan]KILL CHAIN PHASES:[/bold cyan]
+  0. 🛡️  CDN Bypass      — Detects Cloudflare/Akamai/Fastly, discovers origin IPs
   1. 🔍 Reconnaissance  — Subdomain enum, port scan, service detection
   2. ⚔️  Weaponization   — Payload crafting, WAF fingerprinting
   3. 📦 Delivery        — Endpoint discovery, parameter fuzzing
@@ -141,6 +142,16 @@ Think of it as unleashing the Bride on a room full of Crazy 88s.
   5. 🔧 Installation    — Persistence testing
   6. 📡 Command & Ctrl  — Data exfiltration, OOB channels
   7. 🎯 Objectives      — Impact assessment, PoC generation
+
+[bold cyan]CDN BYPASS API KEYS (optional, via environment variables):[/bold cyan]
+  SECURITYTRAILS_API_KEY     SecurityTrails DNS history
+  CENSYS_API_ID              Censys certificate search
+  CENSYS_API_SECRET          Censys API secret
+  SHODAN_API_KEY             Shodan host search
+
+  [dim]Without API keys, Beatrix uses free techniques: DNS history (ViewDNS,
+  DNSDumpster), crt.sh SSL certificates, MX record analysis, subdomain
+  correlation (40+ bypass subdomains), misconfiguration checks, and WHOIS.[/dim]
 """,
     "strike": """
 [bright_yellow]⚔️  STRIKE — Single Module Attack[/bright_yellow]
@@ -510,6 +521,13 @@ Show what weapons and configurations are available.
 # =============================================================================
 
 MODULE_REFERENCE = {
+    # ── Phase 0: CDN Bypass ───────────────────────────────────────────────────
+    "origin_ip": {
+        "name": "Origin IP Discovery",
+        "category": "CDN Bypass",
+        "description": "Discovers real origin IPs behind Cloudflare/Akamai/Fastly/CloudFront to bypass WAF protections",
+        "payloads": "DNS history, crt.sh SSL certs, MX records, subdomain correlation, misconfig checks, WHOIS. Optional: SecurityTrails, Censys, Shodan APIs",
+    },
     # ── Phase 1: Reconnaissance ───────────────────────────────────────────────
     "crawl": {
         "name": "Target Crawler",
@@ -1130,8 +1148,26 @@ def setup_cmd(ctx, check):
 @click.option("--output", "-o", type=click.Path(), help="Output directory")
 @click.option("--file", "-f", "targets_file", type=click.Path(exists=True),
               help="Text file with URLs/domains to hunt (one per line)")
+# ── Authentication options ────────────────────────────────────────────────
+@click.option("--auth-config", type=click.Path(exists=True),
+              help="Path to auth YAML config file (default: ~/.beatrix/auth.yaml)")
+@click.option("--cookie", "cli_cookies", multiple=True,
+              help="Cookie to inject (repeatable, format: name=value)")
+@click.option("--header", "cli_headers", multiple=True,
+              help="Header to inject (repeatable, format: 'Name: Value')")
+@click.option("--token", "cli_token", default=None,
+              help="Bearer token for authenticated scanning")
+@click.option("--auth-user", default=None, help="Username for basic auth")
+@click.option("--auth-pass", default=None, help="Password for basic auth")
+@click.option("--login-user", default=None, help="Username/email for auto-login (like Burp Suite)")
+@click.option("--login-pass", default=None, help="Password for auto-login")
+@click.option("--login-url", default=None, help="Login page URL (auto-detected if omitted)")
+@click.option("--manual-login", is_flag=True, help="Open browser for manual login (handles OTP/captcha)")
+@click.option("--fresh-login", is_flag=True, help="Ignore saved session, force re-authentication")
 @click.pass_context
-def hunt(ctx, target, preset, ai, modules, output, targets_file):
+def hunt(ctx, target, preset, ai, modules, output, targets_file,
+         auth_config, cli_cookies, cli_headers, cli_token, auth_user, auth_pass,
+         login_user, login_pass, login_url, manual_login, fresh_login):
     """
     Hunt for vulnerabilities on TARGET or a file of targets.
 
@@ -1186,6 +1222,15 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file):
                     t, preset=preset, ai=ai,
                     modules=list(modules) if modules else None,
                     output=output,
+                    auth_config=auth_config,
+                    cli_cookies=cli_cookies,
+                    cli_headers=cli_headers,
+                    cli_token=cli_token,
+                    auth_user=auth_user,
+                    auth_pass=auth_pass,
+                    login_user=login_user,
+                    login_pass=login_pass,
+                    login_url=login_url,
                 )
                 all_findings.extend(h_findings)
                 if h_id:
@@ -1338,6 +1383,101 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file):
 
     engine = BeatrixEngine(on_event=_on_event)
 
+    # ── Load authentication credentials ───────────────────────────────────
+    auth_creds = None
+    try:
+        from beatrix.core.auth_config import AuthConfigLoader
+        auth_creds = AuthConfigLoader.load(
+            target=target,
+            config_path=auth_config,
+            cli_cookies=list(cli_cookies) if cli_cookies else None,
+            cli_headers=list(cli_headers) if cli_headers else None,
+            cli_token=cli_token,
+            cli_user=auth_user,
+            cli_password=auth_pass,
+            login_user=login_user,
+            login_pass=login_pass,
+            login_url=login_url,
+        )
+
+        # ── Manual browser login (for OTP/captcha sites) ──────────────────
+        if manual_login:
+            console.print(f"[cyan]🌐 Manual browser login for {target}...[/cyan]")
+            try:
+                from beatrix.core.auto_login import browser_interactive_login, save_session
+                login_result = asyncio.run(browser_interactive_login(target))
+                if login_result.success:
+                    auth_creds.cookies.update(login_result.cookies)
+                    auth_creds.headers.update(login_result.headers)
+                    if login_result.token:
+                        auth_creds.bearer_token = login_result.token
+                    console.print(f"[green]🔐 {login_result.message}[/green]")
+                else:
+                    console.print(f"[red]🔐 Manual login failed: {login_result.message}[/red]")
+                    console.print("[yellow]   Continuing scan without authenticated session[/yellow]")
+            except Exception as e:
+                console.print(f"[red]🔐 Manual login error: {e}[/red]")
+                console.print("[yellow]   Continuing scan without authenticated session[/yellow]")
+
+        # ── Check for saved session ────────────────────────────────────────
+        elif not fresh_login and not auth_creds.has_auth:
+            try:
+                from beatrix.core.auto_login import load_session
+                from urllib.parse import urlparse as _urlparse
+                _domain = _urlparse(target if "://" in target else f"https://{target}").netloc
+                saved = load_session(_domain)
+                if saved and saved.success:
+                    auth_creds.cookies.update(saved.cookies)
+                    auth_creds.headers.update(saved.headers)
+                    if saved.token:
+                        auth_creds.bearer_token = saved.token
+                    console.print(f"[green]🔐 {saved.message}[/green]")
+            except Exception:
+                pass
+
+        # ── Auto-login if credentials provided ────────────────────────────
+        if not manual_login and not auth_creds.has_auth and auth_creds.has_login_creds:
+            console.print(f"[cyan]🔐 Auto-login: logging in as {auth_creds.login_username}...[/cyan]")
+            try:
+                from beatrix.core.auto_login import perform_auto_login, save_session
+                login_result = asyncio.run(perform_auto_login(auth_creds, target=target))
+                if login_result.success:
+                    auth_creds.cookies.update(login_result.cookies)
+                    auth_creds.headers.update(login_result.headers)
+                    if login_result.token:
+                        auth_creds.bearer_token = login_result.token
+                    console.print(f"[green]🔐 {login_result.message}[/green]")
+                    # Save session for reuse
+                    from urllib.parse import urlparse as _urlparse
+                    _domain = _urlparse(target if "://" in target else f"https://{target}").netloc
+                    save_session(_domain, login_result)
+                    console.print(f"[dim]   Session saved — will reuse on next scan (--fresh-login to re-auth)[/dim]")
+                elif login_result.otp_required:
+                    console.print(f"[yellow]🔐 {login_result.message}[/yellow]")
+                    console.print("[yellow]   Tip: use --manual-login to complete OTP in browser[/yellow]")
+                    console.print("[yellow]   Or:  beatrix auth browser " + target + "[/yellow]")
+                    console.print("[yellow]   Continuing scan without authenticated session[/yellow]")
+                else:
+                    console.print(f"[red]🔐 Login failed: {login_result.message}[/red]")
+                    console.print("[yellow]   Continuing scan without authenticated session[/yellow]")
+            except Exception as e:
+                console.print(f"[red]🔐 Auto-login error: {e}[/red]")
+                console.print("[yellow]   Continuing scan without authenticated session[/yellow]")
+
+        if auth_creds.has_auth:
+            parts = []
+            if auth_creds.cookies:
+                parts.append(f"{len(auth_creds.cookies)} cookies")
+            if auth_creds.merged_headers():
+                parts.append(f"{len(auth_creds.merged_headers())} headers")
+            if auth_creds.basic_auth:
+                parts.append("basic auth")
+            console.print(f"[green]🔐 Auth loaded: {', '.join(parts)}[/green]")
+            if auth_creds.has_idor_accounts:
+                console.print("[green]   ↳ IDOR: 2 user sessions configured[/green]")
+    except Exception as e:
+        console.print(f"[dim]  Auth config: {e}[/dim]")
+
     try:
         # Print events to console in real-time (non-blocking)
         import threading
@@ -1366,6 +1506,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file):
             preset=preset,
             ai=ai,
             modules=list(modules) if modules else None,
+            auth=auth_creds,
         ))
 
         _stop_printer.set()
@@ -1435,7 +1576,10 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file):
 
 
 def _hunt_single_target(target, preset="standard", ai=False, modules=None,
-                        output=None):
+                        output=None, auth_config=None, cli_cookies=None,
+                        cli_headers=None, cli_token=None, auth_user=None,
+                        auth_pass=None, login_user=None, login_pass=None,
+                        login_url=None):
     """
     Run a full hunt on a single target. Used by both single-target and
     multi-target (--file) modes.
@@ -1503,6 +1647,74 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
 
     engine = BeatrixEngine(on_event=_on_event)
 
+    # Load auth credentials for this target
+    auth_creds = None
+    try:
+        from beatrix.core.auth_config import AuthConfigLoader
+        auth_creds = AuthConfigLoader.load(
+            target=target,
+            config_path=auth_config,
+            cli_cookies=list(cli_cookies) if cli_cookies else None,
+            cli_headers=list(cli_headers) if cli_headers else None,
+            cli_token=cli_token,
+            cli_user=auth_user,
+            cli_password=auth_pass,
+            login_user=login_user,
+            login_pass=login_pass,
+            login_url=login_url,
+        )
+
+        # Auto-login if credentials provided
+        if auth_creds.has_login_creds:
+            # Check for saved session first
+            try:
+                from beatrix.core.auto_login import load_session
+                from urllib.parse import urlparse as _urlparse
+                _domain = _urlparse(target if "://" in target else f"https://{target}").netloc
+                saved = load_session(_domain)
+                if saved and saved.success:
+                    auth_creds.cookies.update(saved.cookies)
+                    auth_creds.headers.update(saved.headers)
+                    if saved.token:
+                        auth_creds.bearer_token = saved.token
+                    console.print(f"[green]🔐 {saved.message}[/green]")
+            except Exception:
+                pass
+
+            if not auth_creds.has_auth:
+                console.print(f"[cyan]🔐 Auto-login: logging in as {auth_creds.login_username}...[/cyan]")
+                try:
+                    from beatrix.core.auto_login import perform_auto_login, save_session
+                    login_result = asyncio.run(perform_auto_login(auth_creds, target=target))
+                    if login_result.success:
+                        auth_creds.cookies.update(login_result.cookies)
+                        auth_creds.headers.update(login_result.headers)
+                        if login_result.token:
+                            auth_creds.bearer_token = login_result.token
+                        console.print(f"[green]🔐 {login_result.message}[/green]")
+                        from urllib.parse import urlparse as _urlparse
+                        _domain = _urlparse(target if "://" in target else f"https://{target}").netloc
+                        save_session(_domain, login_result)
+                    elif login_result.otp_required:
+                        console.print(f"[yellow]🔐 {login_result.message}[/yellow]")
+                        console.print(f"[yellow]   Tip: beatrix auth browser {target}[/yellow]")
+                    else:
+                        console.print(f"[red]🔐 Login failed: {login_result.message}[/red]")
+                except Exception as e:
+                    console.print(f"[red]🔐 Auto-login error: {e}[/red]")
+
+        if auth_creds.has_auth:
+            parts = []
+            if auth_creds.cookies:
+                parts.append(f"{len(auth_creds.cookies)} cookies")
+            if auth_creds.merged_headers():
+                parts.append(f"{len(auth_creds.merged_headers())} headers")
+            if auth_creds.basic_auth:
+                parts.append("basic auth")
+            console.print(f"[green]🔐 Auth loaded: {', '.join(parts)}[/green]")
+    except Exception:
+        pass
+
     def _printer():
         while not _stop_printer.is_set():
             while _printed_count[0] < len(progress_state["log"]):
@@ -1519,6 +1731,7 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
     try:
         state = asyncio.run(engine.hunt(
             target=target, preset=preset, ai=ai, modules=modules,
+            auth=auth_creds,
         ))
     finally:
         _stop_printer.set()
@@ -2925,6 +3138,489 @@ def browser_scan(ctx, url, login_url, email, password, visible):
         console.print(table)
     else:
         console.print("[green]No browser-based vulnerabilities found.[/green]")
+
+
+# =============================================================================
+# AUTH CONFIG COMMANDS
+# =============================================================================
+
+@cli.group("auth")
+@click.pass_context
+def auth_group(ctx):
+    """
+    Manage authentication configuration for scanning.
+
+    Configure credentials that flow to all scanners — nuclei gets -H flags,
+    IDOR gets user sessions, crawler gets cookies for authenticated crawling.
+
+    Examples:
+        beatrix auth login         # Interactive credential setup wizard
+        beatrix auth show          # Show current auth state
+        beatrix auth init          # Generate sample auth config file
+    """
+    if ctx.invoked_subcommand is None:
+        click.echo(ctx.get_help())
+
+
+@auth_group.command("init")
+@click.option("--force", is_flag=True, help="Overwrite existing config")
+def auth_init(force):
+    """Generate a sample auth config file (~/.beatrix/auth.yaml)."""
+    from pathlib import Path
+
+    config_path = Path.home() / ".beatrix" / "auth.yaml"
+
+    if config_path.exists() and not force:
+        console.print(f"[yellow]Config already exists: {config_path}[/yellow]")
+        console.print("[dim]Use --force to overwrite[/dim]")
+        return
+
+    try:
+        from beatrix.core.auth_config import AuthConfigLoader
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        sample = AuthConfigLoader.generate_sample_config()
+        config_path.write_text(sample)
+        console.print(f"[green]✓ Sample auth config created: {config_path}[/green]")
+        console.print()
+        console.print("[bold]Next steps:[/bold]")
+        console.print(f"  1. Edit [cyan]{config_path}[/cyan]")
+        console.print("  2. Add your cookies, tokens, or login credentials")
+        console.print("  3. Run [cyan]beatrix hunt target.com[/cyan] — auth is auto-loaded")
+        console.print()
+        console.print("[bold]Auto-login (like Burp Suite):[/bold]")
+        console.print("  beatrix hunt target.com --login-user 'user@email.com' --login-pass 'password'")
+        console.print("  beatrix hunt target.com --login-user 'admin' --login-pass 'pass' --login-url '/login'")
+        console.print()
+        console.print("[bold]Or use pre-authenticated tokens:[/bold]")
+        console.print("  beatrix hunt target.com --token 'Bearer eyJ...'")
+        console.print("  beatrix hunt target.com --cookie 'session=abc123'")
+        console.print("  beatrix hunt target.com --header 'X-API-Key: key123'")
+    except Exception as e:
+        console.print(f"[red]Failed to create config: {e}[/red]")
+
+
+@auth_group.command("config")
+def auth_config_cmd():
+    """Open the auth config file in your default editor."""
+    import os
+    import subprocess
+    from pathlib import Path
+
+    config_path = Path.home() / ".beatrix" / "auth.yaml"
+
+    if not config_path.exists():
+        console.print("[yellow]No config file found. Creating one first...[/yellow]")
+        try:
+            from beatrix.core.auth_config import AuthConfigLoader
+            config_path.parent.mkdir(parents=True, exist_ok=True)
+            config_path.write_text(AuthConfigLoader.generate_sample_config())
+            console.print(f"[green]✓ Created {config_path}[/green]")
+        except Exception as e:
+            console.print(f"[red]Failed to create config: {e}[/red]")
+            return
+
+    editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+    if not editor:
+        # Try common editors in order of preference
+        for candidate in ["nano", "vim", "vi", "code"]:
+            if subprocess.run(["which", candidate], capture_output=True).returncode == 0:
+                editor = candidate
+                break
+        else:
+            editor = "nano"
+
+    console.print(f"[dim]Opening {config_path} with {editor}...[/dim]")
+    os.execvp(editor, [editor, str(config_path)])
+
+
+@auth_group.command("login")
+@click.argument("target", required=False)
+def auth_login_wizard(target):
+    """Interactive credential setup — enter username & password for auto-login.
+
+    \b
+    Launches a guided wizard to configure login credentials.
+    Beatrix will use these to auto-authenticate before scanning,
+    just like setting up a login macro in Burp Suite.
+
+    \b
+    Examples:
+        beatrix auth login              # General credentials
+        beatrix auth login kick.com     # Target-specific credentials
+    """
+    import getpass
+    from pathlib import Path
+    from rich.prompt import Prompt, Confirm
+
+    console.print()
+    console.print(Panel.fit(
+        "[bold]Auto-Login Setup[/bold]\n"
+        "[dim]Enter credentials and Beatrix will log in automatically,\n"
+        "capture the session, and use it for authenticated scanning.[/dim]",
+        title="[bold bright_cyan]🔐 Beatrix Auth[/bold bright_cyan]",
+        border_style="cyan",
+    ))
+    console.print()
+
+    # ── Step 1: Target ─────────────────────────────────────────────────
+    if not target:
+        target = Prompt.ask(
+            "[bold]Target domain[/bold] [dim](e.g. kick.com, blank for all)[/dim]",
+            default="",
+        ).strip()
+
+    target_label = target or "all targets"
+    console.print()
+
+    # ── Step 2: Username / Email ───────────────────────────────────────
+    username = Prompt.ask(
+        "[bold]Username or email[/bold]",
+    ).strip()
+    if not username:
+        console.print("[red]Username is required.[/red]")
+        return
+    console.print()
+
+    # ── Step 3: Password (masked) ──────────────────────────────────────
+    password = getpass.getpass("  Password: ")
+    if not password:
+        console.print("[red]Password is required.[/red]")
+        return
+    console.print()
+
+    # ── Step 4: Login URL (optional) ───────────────────────────────────
+    login_url = Prompt.ask(
+        "[bold]Login URL[/bold] [dim](leave blank to auto-detect)[/dim]",
+        default="",
+    ).strip()
+    console.print()
+
+    # ── Step 5: Method ─────────────────────────────────────────────────
+    method = Prompt.ask(
+        "[bold]Login method[/bold]",
+        choices=["auto", "form", "json"],
+        default="auto",
+    )
+    console.print()
+
+    # ── Step 6: Additional auth (optional) ─────────────────────────────
+    add_token = ""
+    add_cookies = {}
+    if Confirm.ask("[bold]Add a bearer token or cookies too?[/bold]", default=False):
+        token_str = Prompt.ask(
+            "  [bold]Bearer token[/bold] [dim](blank to skip)[/dim]",
+            default="",
+        ).strip()
+        if token_str:
+            add_token = token_str
+
+        cookie_str = Prompt.ask(
+            "  [bold]Cookies[/bold] [dim](format: name=value; name2=value2, blank to skip)[/dim]",
+            default="",
+        ).strip()
+        if cookie_str:
+            for part in cookie_str.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, _, v = part.partition("=")
+                    add_cookies[k.strip()] = v.strip()
+    console.print()
+
+    # ── Save to config file ────────────────────────────────────────────
+    config_path = Path.home() / ".beatrix" / "auth.yaml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import yaml
+        has_yaml = True
+    except ImportError:
+        has_yaml = False
+
+    if has_yaml:
+        # Load existing config or start fresh
+        existing = {}
+        if config_path.exists():
+            try:
+                existing = yaml.safe_load(config_path.read_text()) or {}
+            except Exception:
+                existing = {}
+
+        if target:
+            # Per-target config
+            targets_cfg = existing.get("targets") or {}
+            existing["targets"] = targets_cfg
+            target_cfg = targets_cfg.get(target) or {}
+            targets_cfg[target] = target_cfg
+            target_cfg["login"] = {
+                "username": username,
+                "password": password,
+            }
+            if login_url:
+                target_cfg["login"]["url"] = login_url
+            if method != "auto":
+                target_cfg["login"]["method"] = method
+            if add_token:
+                hdrs = target_cfg.get("headers") or {}
+                hdrs["Authorization"] = f"Bearer {add_token}"
+                target_cfg["headers"] = hdrs
+            if add_cookies:
+                cks = target_cfg.get("cookies") or {}
+                cks.update(add_cookies)
+                target_cfg["cookies"] = cks
+        else:
+            # Global login config
+            existing["login"] = {
+                "username": username,
+                "password": password,
+            }
+            if login_url:
+                existing["login"]["url"] = login_url
+            if method != "auto":
+                existing["login"]["method"] = method
+            if add_token:
+                gcfg = existing.get("global") or {}
+                hdrs = gcfg.get("headers") or {}
+                hdrs["Authorization"] = f"Bearer {add_token}"
+                gcfg["headers"] = hdrs
+                existing["global"] = gcfg
+            if add_cookies:
+                gcfg = existing.get("global") or {}
+                cks = gcfg.get("cookies") or {}
+                cks.update(add_cookies)
+                gcfg["cookies"] = cks
+                existing["global"] = gcfg
+
+        config_path.write_text(yaml.dump(existing, default_flow_style=False, sort_keys=False))
+    else:
+        # Fallback: write raw YAML manually
+        lines = []
+        if config_path.exists():
+            lines = config_path.read_text().splitlines()
+            lines.append("")
+
+        if target:
+            lines.append(f'targets:')
+            lines.append(f'  "{target}":')
+            lines.append(f'    login:')
+        else:
+            lines.append(f'login:')
+
+        indent = "      " if target else "  "
+        lines.append(f'{indent}username: "{username}"')
+        lines.append(f'{indent}password: "{password}"')
+        if login_url:
+            lines.append(f'{indent}url: "{login_url}"')
+        if method != "auto":
+            lines.append(f'{indent}method: "{method}"')
+
+        config_path.write_text("\n".join(lines) + "\n")
+
+    # ── Summary ────────────────────────────────────────────────────────
+    table = Table(title="Credentials Saved", border_style="green", show_header=False)
+    table.add_column("Field", style="bold")
+    table.add_column("Value")
+    table.add_row("Target", target_label)
+    table.add_row("Username", username)
+    table.add_row("Password", "•" * min(len(password), 12))
+    if login_url:
+        table.add_row("Login URL", login_url)
+    table.add_row("Method", method)
+    if add_token:
+        table.add_row("Token", add_token[:20] + "...")
+    if add_cookies:
+        table.add_row("Cookies", ", ".join(add_cookies.keys()))
+    table.add_row("Config", str(config_path))
+    console.print(table)
+
+    console.print()
+    console.print("[green]✓ Ready! Beatrix will auto-login before scanning.[/green]")
+    if target:
+        console.print(f"[dim]  Run: beatrix hunt {target}[/dim]")
+    else:
+        console.print("[dim]  Run: beatrix hunt <target>[/dim]")
+    console.print()
+
+
+@auth_group.command("show")
+@click.option("--target", "-t", help="Show auth for specific target")
+def auth_show(target):
+    """Show current authentication configuration."""
+    from pathlib import Path
+
+    config_path = Path.home() / ".beatrix" / "auth.yaml"
+
+    if not config_path.exists():
+        console.print("[dim]No auth config file found[/dim]")
+        console.print(f"[dim]Run [cyan]beatrix auth init[/cyan] to create one at {config_path}[/dim]")
+        return
+
+    try:
+        from beatrix.core.auth_config import AuthConfigLoader
+
+        if target:
+            creds = AuthConfigLoader.load(target=target, config_path=str(config_path))
+            console.print(f"\n[bold]Auth for {target}:[/bold]")
+            if creds.has_auth:
+                if creds.headers:
+                    console.print(f"  Headers: {len(creds.headers)}")
+                    for k in creds.headers:
+                        console.print(f"    {k}: {'*' * 8}...")
+                if creds.cookies:
+                    console.print(f"  Cookies: {len(creds.cookies)}")
+                    for k in creds.cookies:
+                        console.print(f"    {k}: {'*' * 8}...")
+                if creds.bearer_token:
+                    console.print(f"  Bearer: {'*' * 8}...")
+                if creds.basic_auth:
+                    console.print(f"  Basic Auth: {creds.basic_auth[0]}")
+                if creds.has_login_creds:
+                    console.print(f"  Login: {creds.login_username} → {creds.login_url or 'auto-detect'}")
+                if creds.has_idor_accounts:
+                    console.print("  IDOR: 2 sessions configured")
+            else:
+                console.print("  [dim]No auth configured[/dim]")
+        else:
+            # Show config file contents summary
+            console.print(f"\n[bold]Auth config:[/bold] {config_path}")
+            try:
+                text = config_path.read_text()
+                # Count non-comment, non-empty lines
+                lines = [l for l in text.splitlines() if l.strip() and not l.strip().startswith("#")]
+                console.print(f"  {len(lines)} config lines")
+            except Exception:
+                pass
+
+            # Check env vars
+            import os
+            env_vars = ["BEATRIX_AUTH_TOKEN", "BEATRIX_AUTH_COOKIE", "BEATRIX_AUTH_HEADER",
+                       "BEATRIX_AUTH_USER", "BEATRIX_AUTH_PASS",
+                       "BEATRIX_LOGIN_USER", "BEATRIX_LOGIN_PASS", "BEATRIX_LOGIN_URL"]
+            set_vars = [v for v in env_vars if os.environ.get(v)]
+            if set_vars:
+                console.print(f"  Environment: {', '.join(set_vars)}")
+            else:
+                console.print("  [dim]No env vars set[/dim]")
+
+    except Exception as e:
+        console.print(f"[red]Error: {e}[/red]")
+
+
+@auth_group.command("browser")
+@click.argument("target")
+def auth_browser(target):
+    """Manual browser login — handles OTP, captcha, anything.
+
+    \b
+    Opens a browser (or cookie-paste prompt in headless environments)
+    for you to complete the login manually. Beatrix captures the session
+    cookies and saves them for reuse in future scans.
+
+    \b
+    Use this when auto-login fails due to OTP, 2FA, captcha, or
+    other interactive challenges.
+
+    \b
+    Examples:
+        beatrix auth browser kick.com
+        beatrix auth browser https://app.example.com
+    """
+    from beatrix.core.auto_login import browser_interactive_login, save_session
+
+    console.print(Panel.fit(
+        f"[bold]Target:[/bold] {target}\n"
+        "[dim]Complete the login in the browser (OTP, captcha, etc.).\n"
+        "Beatrix will capture your session automatically.[/dim]",
+        title="[bold bright_cyan]🌐 Manual Browser Login[/bold bright_cyan]",
+        border_style="cyan",
+    ))
+
+    result = asyncio.run(browser_interactive_login(target))
+
+    if result.success:
+        console.print(f"\n[green]✓ {result.message}[/green]")
+
+        from rich.table import Table as RichTable
+        table = RichTable(title="Captured Session", border_style="green", show_header=False)
+        table.add_column("Field", style="bold")
+        table.add_column("Value")
+        if result.cookies:
+            table.add_row("Cookies", ", ".join(result.cookies.keys()))
+        if result.token:
+            table.add_row("Token", result.token[:30] + "...")
+        table.add_row("Method", result.method_used)
+        console.print(table)
+
+        console.print(f"\n[green]Session saved! Run your scan:[/green]")
+        console.print(f"[dim]  beatrix hunt {target}[/dim]")
+    else:
+        console.print(f"\n[red]✗ {result.message}[/red]")
+        console.print("[dim]  You can also pass cookies directly:[/dim]")
+        console.print(f'[dim]  beatrix hunt {target} --cookie "session=YOUR_SESSION_VALUE"[/dim]')
+
+
+@auth_group.command("sessions")
+@click.option("--clear", "-c", help="Clear saved session for a domain")
+@click.option("--clear-all", is_flag=True, help="Clear all saved sessions")
+def auth_sessions(clear, clear_all):
+    """Manage saved login sessions.
+
+    \b
+    Sessions are saved after successful logins and reused automatically.
+    They expire after 24 hours.
+
+    \b
+    Examples:
+        beatrix auth sessions              # List all saved sessions
+        beatrix auth sessions --clear kick.com  # Clear one session
+        beatrix auth sessions --clear-all  # Clear all sessions
+    """
+    from beatrix.core.auto_login import clear_session, list_sessions, SESSIONS_DIR
+
+    if clear_all:
+        if SESSIONS_DIR.exists():
+            import shutil
+            count = len(list(SESSIONS_DIR.glob("*.json")))
+            shutil.rmtree(SESSIONS_DIR)
+            console.print(f"[green]✓ Cleared {count} saved sessions[/green]")
+        else:
+            console.print("[dim]No saved sessions to clear[/dim]")
+        return
+
+    if clear:
+        if clear_session(clear):
+            console.print(f"[green]✓ Cleared session for {clear}[/green]")
+        else:
+            console.print(f"[dim]No saved session for {clear}[/dim]")
+        return
+
+    sessions = list_sessions()
+    if not sessions:
+        console.print("[dim]No saved sessions[/dim]")
+        console.print("[dim]Run: beatrix auth browser <target>[/dim]")
+        return
+
+    from rich.table import Table as RichTable
+    table = RichTable(title="Saved Sessions", border_style="cyan")
+    table.add_column("Domain", style="bold")
+    table.add_column("Age", style="dim")
+    table.add_column("Cookies")
+    table.add_column("Token")
+    table.add_column("Method")
+    table.add_column("Saved At", style="dim")
+
+    for s in sessions:
+        age_str = f"{s['age_hours']:.0f}h"
+        expired = s['age_hours'] > 24
+        age_color = "red" if expired else "green"
+        table.add_row(
+            s["domain"],
+            f"[{age_color}]{age_str}{'  [expired]' if expired else ''}[/{age_color}]",
+            str(s["cookies"]),
+            "✓" if s["has_token"] else "—",
+            s["method"],
+            s["saved_at"],
+        )
+    console.print(table)
 
 
 # =============================================================================
