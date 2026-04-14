@@ -1182,7 +1182,7 @@ def hunt(ctx, target, preset, ai, modules, output, targets_file,
     \b
     Run 'beatrix help hunt' for full documentation.
     """
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     # ── Resolve target list ───────────────────────────────────────────────
     if targets_file:
@@ -1590,7 +1590,7 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
         (hunt_id, findings) — hunt_id may be None if DB save fails.
     """
     import threading
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     progress_state = {
         "phase": "", "phase_icon": "", "scanner": "",
@@ -1786,7 +1786,7 @@ def _hunt_single_target(target, preset="standard", ai=False, modules=None,
 
 def _display_hunt_results(state, engine, hunt_id=None):
     """Display hunt results with full detail for each finding."""
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     stats = engine.get_stats()
     duration = (datetime.now() - state.started_at).total_seconds()
@@ -2023,7 +2023,7 @@ def _export_json(findings, filepath=None, target=None):
     so that ``beatrix validate <file>`` can consume it directly.
     """
     import json as _json
-    from datetime import datetime
+    from datetime import datetime, timezone
 
     finding_list = []
     for f in findings:
@@ -2060,7 +2060,7 @@ def _export_json(findings, filepath=None, target=None):
             "version": "1.0.0",
             "target": target,
             "total_findings": len(finding_list),
-            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
         },
     }
 
@@ -2311,7 +2311,7 @@ def findings_export(hunt_id, severity, module, target, output, fmt):
                 f[key] = []
 
     if fmt == "json":
-        from datetime import datetime
+        from datetime import datetime, timezone
         report = {
             "findings": results,
             "metadata": {
@@ -2319,7 +2319,7 @@ def findings_export(hunt_id, severity, module, target, output, fmt):
                 "version": "1.0.0",
                 "target": target,
                 "total_findings": len(results),
-                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
                 "filters": {
                     "hunt_id": hunt_id,
                     "severity": severity,
