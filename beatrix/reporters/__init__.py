@@ -8,7 +8,7 @@ Enriches findings with Bugcrowd VRT classification and CVSS 3.1 scores.
 
 import json  # noqa: F401
 from dataclasses import asdict  # noqa: F401
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional  # noqa: F401
 
@@ -318,7 +318,7 @@ xhr.send();
         Produces a standardised ``{"findings": [...], "metadata": {...}}``
         envelope compatible with ``beatrix validate``.
         """
-        from datetime import datetime
+        from datetime import datetime, timezone
 
         finding_list = []
         for f in findings:
@@ -344,7 +344,7 @@ xhr.send();
                 "version": "1.0.0",
                 "target": target,
                 "total_findings": len(finding_list),
-                "generated_at": datetime.utcnow().isoformat() + "Z",
+                "generated_at": datetime.now(timezone.utc).isoformat() + "Z",
             },
         }
 
